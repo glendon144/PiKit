@@ -1,0 +1,12 @@
+--- modules/hypertext_parser.py
+- pattern = r"\[\[(.*?)\|doc:(\d+)\]\]"
++ pattern = r"\[([^\]]+)\]\(doc:(\d+)\)"
+
+--- modules/gui_tkinter.py  (ask_ai_autolink)
+- link_markup = f"[[{selected_text}|doc:{new_doc_id}]]"
++ link_markup = f"[{selected_text}](doc:{new_doc_id})"
+
+--- modules/document_store.py
++    def update_document(self, doc_id, body):
++        self.edit_document(doc_id, body)
+

@@ -1,0 +1,76 @@
+LIST
+LIST
+View 1
+View 1
+FOLLOW 2
+FOLLOW 2
+LINKS
+LINKS
+exit
+help
+help
+LINKS
+LINKS
+LIST
+LIST
+links 22
+links 22
+links 21
+links 21
+links 20
+links 20
+links 1
+links 1
+links 2
+links 2
+links 14
+links 14
+view 20
+view 20
+EDIT 20
+EDIT 20
+for more information,  see http://jazz.clonesvr.com/
+links 20
+links 20
+LINKS 20
+LINKS 20
+VIEW 20
+VIEW 20
+exit
+help
+help
+list
+list
+links 22
+links 22
+links 21
+links 21
+links 20
+links 20
+view 20
+view 20
+links 20
+links 20
+exit
+help
+help
+LOGS
+LOGS
+LIST
+LIST
+LINKS 22
+LINKS 22
+LINKS 21
+LINKS 21
+view 22
+view 22
+view 21
+view 21
+view 20
+view 20
+view 20
+links 20
+links 20
+FOLLOW 4
+FOLLOW 4
+exit

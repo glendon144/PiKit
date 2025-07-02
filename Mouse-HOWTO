@@ -1,0 +1,27 @@
+To add a mouse to a Python NLS (Natural Language Understanding) project, you can use a library like PyAutoGUI which allows you to control the mouse cursor and click events programmatically.
+
+Here's a simple example of how you can use PyAutoGUI to move the mouse cursor to a specific position and click:
+
+1. First, install the PyAutoGUI library by running the following command:
+```
+pip install pyautogui
+```
+
+2. Import the PyAutoGUI library in your Python script:
+```python
+import pyautogui
+```
+
+3. Use the `moveTo` function to move the mouse cursor to a specific position on the screen (x, y coordinates):
+```python
+pyautogui.moveTo(x=100, y=100)
+```
+
+4. Use the `click` function to simulate a mouse click at the current cursor position:
+```python
+pyautogui.click()
+```
+
+You can also perform other mouse actions such as dragging, scrolling, etc. using PyAutoGUI. Make sure to check the PyAutoGUI documentation for more information on its capabilities.
+
+Keep in mind that using automated mouse movements and clicks can have security implications and may not be allowed in some environments, so use it responsibly.

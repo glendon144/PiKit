@@ -1,0 +1,22 @@
+To install a linting tool for Python code on Ubuntu 32-bit, you can use a popular tool called `pylint`. Here are the steps to install `pylint` on Ubuntu 32-bit:
+
+1. Open a terminal window by pressing `Ctrl` + `Alt` + `T`.
+
+2. Update your package list by running the following command:
+```
+sudo apt-get update
+```
+
+3. Install `pylint` by running the following command:
+```
+sudo apt-get install pylint
+```
+
+4. Once the installation is complete, you can use `pylint` to lint your Python code by running the following command:
+```
+pylint your_python_file.py
+```
+
+Replace `your_python_file.py` with the name of the Python file you want to lint.
+
+That's it! You have successfully installed and used `pylint` to lint your Python code on Ubuntu 32-bit.

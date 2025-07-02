@@ -1,0 +1,26 @@
+import openai
+import os
+
+class AIInterface:
+    def __init__(self):
+        self.api_key = os.getenv("OPENAI_API_KEY")
+        openai.api_key = self.api_key
+
+    def query(self, prompt):
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            return response['choices'][0]['message']['content'].strip()
+        except Exception as e:
+            return f"Error during AI query: {e}"
+
+    def has_api_key(self):
+        return bool(self.api_key)
+
+    def set_api_key(self, key):
+        self.api_key = key
+        openai.api_key = key

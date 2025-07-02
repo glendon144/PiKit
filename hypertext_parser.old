@@ -1,0 +1,40 @@
+# modules/hypertext_parser.py
+
+import re
+
+def insert_hyperlink_tags(text_widget, content):
+    """
+    Parses the content for markdown-style hyperlinks [label](doc_id)
+    and adds tags to the tkinter Text widget to make them clickable.
+    """
+    text_widget.mark_set("range_start", "1.0")
+    pattern = r'\[([^\]]+)\]\((\d+)\)'
+    start = "1.0"
+
+    while True:
+        match = re.search(pattern, content)
+        if not match:
+            break
+
+        label, doc_id = match.groups()
+        match_start = content.find(match.group(0))
+        match_end = match_start + len(match.group(0))
+
+        # Replace the hyperlink markdown with just the label
+        content = content[:match_start] + label + content[match_end:]
+
+        # Tag the label
+        end_index = f"{start}+{match_start + len(label)}c"
+        text_widget.insert(f"{start}+{match_start}c", label)
+        text_widget.tag_add("link", f"{start}+{match_start}c", end_index)
+
+    text_widget.insert(start, content)
+
+def extract_links(content):
+    """
+    Extracts all markdown-style hyperlinks [label](doc_id)
+    Returns a list of (label, doc_id) tuples.
+    """
+    pattern = r'\[([^\]]+)\]\((\d+)\)'
+    return re.findall(pattern, content)
+
