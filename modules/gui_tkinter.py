@@ -4,8 +4,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, simpledialog, messagebox
 from pathlib import Path
 from PIL import ImageTk
-from modules import hypertext_parser, image_generator
-from modules.logger import Logger
+from modules import hypertext_parser, image_generator, logger
+from modules.logger import log
 
 
 class DemoKitGUI(tk.Tk):
