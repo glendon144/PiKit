@@ -1,56 +1,34 @@
-import openai
 import os
+import openai
 from modules.logger import Logger
 
+
 class AIInterface:
+    KEY_PATH = os.path.expanduser("~/openai.key")
+
     def __init__(self, logger=None):
+        self.logger = logger or Logger()
         self.api_key = None
-        self.logger = logger if logger else Logger()
-        self.load_api_key_from_file()
+        if os.path.exists(self.KEY_PATH):
+            self.set_api_key(open(self.KEY_PATH).read().strip())
 
-    def load_api_key_from_file(self):
-        """
-        Try to load API key from common key files:
-          - ~/openai_key
-          - ~/openai.key
-          - /home/<user>/openai.key (expanduser)
-        """
-        possible_paths = [
-            os.path.expanduser("~/openai_key"),
-            os.path.expanduser("~/openai.key")
-        ]
-        for path in possible_paths:
-            if os.path.exists(path):
-                with open(path, "r") as f:
-                    self.api_key = f.read().strip()
-                openai.api_key = self.api_key
-                self.logger.info(f"API key loaded from file: {path}")
-                return
+    def set_api_key(self, key: str):
+        self.api_key = key.strip()
+        openai.api_key = self.api_key
+        self.logger.info("OpenAI API key set.")
 
-        # If not found yet, log and defer to manual input
-        self.logger.info("No API key file found. You can import it via the GUI or set via set_api_key().")
-
-    def set_api_key(self, key):
-        self.api_key = key
-        openai.api_key = key
-        self.logger.info("API key successfully set")
-
-    def get_api_key(self):
-        return self.api_key
-
-    def query(self, prompt):
+    def query(self, prompt: str) -> str:
         if not self.api_key:
-            raise Exception("API key not set.")
+            raise RuntimeError("OpenAI API key not set")
         try:
-            self.logger.debug(f"Querying OpenAI with prompt: {prompt}")
-            response = openai.ChatCompletion.create(
-                model="gpt-4",
+            resp = openai.ChatCompletion.create(
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.7
+                temperature=0.7,
             )
-            reply = response["choices"][0]["message"]["content"]
-            self.logger.debug("AI Query successful")
+            reply = resp["choices"][0]["message"]["content"].strip()
+            self.logger.info(f"AI reply received ({len(reply)} chars)")
             return reply
-        except Exception as e:
-            self.logger.error(f"OpenAI API call failed: {e}")
+        except Exception as exc:
+            self.logger.error(f"OpenAI error: {exc}")
             raise

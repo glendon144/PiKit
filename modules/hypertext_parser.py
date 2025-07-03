@@ -1,40 +1,30 @@
 import re
+import tkinter as tk
 
-def parse_links(text_widget, content, link_callback):
+LINK_PATTERN = re.compile(r"\[([^\]]+)]\(doc:(\d+)\)")
+
+
+def parse_links(text_widget: tk.Text, raw_text: str, on_open_doc):
+    """Scan *raw_text* for markdown links like `[label](doc:123)`.
+
+    When found, add a `link` tag to the matching range in *text_widget* and bind
+    a click to `on_open_doc(doc_id)`.
     """
-    Parses markdown-style links such as "[label](id:123)" or "[label](doc:123)"
-    and makes them clickable, marking visited links in dark green.
-    This method delegates all text insertion to the parser to avoid raw markdown.
-    """
-    # Accept both id:123 and doc:123
-    link_pattern = re.compile(r'\[([^\]]+)\]\((?:id|doc):(\d+)\)')
-    pos = 0
-    for match in link_pattern.finditer(content):
-        start, end = match.span()
+    # Wipe old link tags
+    text_widget.tag_delete("link")
+    text_widget.tag_configure("link", foreground="green", underline=True)
+
+    # The Text widget already contains *raw_text*; walk through matches
+    for match in LINK_PATTERN.finditer(raw_text):
         label, doc_id = match.groups()
+        start_idx = f"1.0+{match.start()}c"
+        end_idx = f"1.0+{match.end()}c"
 
-        # Insert plain text before the link
-        if start > pos:
-            text_widget.insert("end", content[pos:start])
+        # Tag this span so it appears as a clickable link
+        text_widget.tag_add("link", start_idx, end_idx)
 
-        # Insert the link text with a unique tag
-        link_start = text_widget.index("end")
-        text_widget.insert("end", label)
-        link_end = text_widget.index("end")
+        # Need a closure to capture doc_id for each match
+        def _make_callback(did):
+            return lambda _evt, _did=did: on_open_doc(int(_did))
 
-        tag_name = f"link_{link_start.replace('.', '_')}"
-        # Configure link appearance
-        text_widget.tag_add(tag_name, link_start, link_end)
-        text_widget.tag_config(tag_name, foreground="green", underline=True)
-
-        # On click, navigate and mark visited
-        def on_click(e, d=doc_id, tag=tag_name):
-            link_callback(int(d))
-            text_widget.tag_config(tag, foreground="darkgreen")
-        text_widget.tag_bind(tag_name, "<Button-1>", on_click)
-
-        pos = end
-
-    # Insert any remaining text after last link
-    if pos < len(content):
-        text_widget.insert("end", content[pos:])
+        text_widget.tag_bind("link", "<Button-1>", _make_callback(doc_id))
