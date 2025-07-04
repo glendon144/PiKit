@@ -1,0 +1,27 @@
+# Virtual environments
+.venv/
+venv/
+demokit-env/
+myenv310/
+myenv39/
+mynewenv/
+
+# Backup and old files
+*.zip
+*.old
+*~
+__pycache__/
+*.bak
+old_scripts/
+backups/
+zips/
+zip/
+storage/
+
+# Data and DB
+*.csv
+*.db
+
+# Other
+*.patch
+
