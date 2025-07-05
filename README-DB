@@ -1,0 +1,23 @@
+
+---
+
+### Sample database
+
+I generated a tiny SQLite DB with three demo documents.  
+Place it at `storage/documents.db` or open it with any SQLite viewer.
+
+[Download `sample_documents.db`](sandbox:/mnt/data/sample_documents.db)
+
+---
+
+### Next steps
+
+* **README.md** – copy the markdown above into a new `README.md`, tweak as you like, commit.  
+* **Sample DB** – add `storage/sample_documents.db` (or keep the link in releases).  
+* Push both:
+
+```bash
+git add README.md storage/sample_documents.db
+git commit -m "Add README and sample_documents.db"
+git push origin main
+
