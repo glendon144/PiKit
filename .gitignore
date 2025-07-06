@@ -22,3 +22,6 @@ storage/*.db
 # Secrets
 credentials/
 
+exported_docs/docs.json
+exported_docs
+openai.key
