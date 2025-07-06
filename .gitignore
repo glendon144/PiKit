@@ -1,27 +1,24 @@
-# Virtual environments
-.venv/
-venv/
-demokit-env/
-myenv310/
-myenv39/
-mynewenv/
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
 
-# Backup and old files
-*.zip
-*.old
-*~
+# Python artefacts
+*.pyc
 __pycache__/
-*.bak
-old_scripts/
-backups/
-zips/
-zip/
-storage/
 
-# Data and DB
-*.csv
-*.db
+# Virtual-envs
+venv/
+myenv*/
+.env/
 
-# Other
-*.patch
+# Local binaries / wheels
+*.whl
+*.pyd
+
+# Databases & cache
+storage/*.db
+
+# Secrets
+credentials/
 
