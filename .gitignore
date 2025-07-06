@@ -25,3 +25,5 @@ credentials/
 exported_docs/docs.json
 exported_docs
 openai.key
+exported_docs/
+OpenAI.key
