@@ -1,0 +1,17 @@
+# PiKit requirements.txt
+
+# Install numpy first so its C-headers are available for pandas
+numpy>=1.24.0
+
+# Use a version of pandas that ships a pre-built wheel for Python 3.10 on Linux
+pandas>=2.0.3
+
+# Other dependencies
+pyserial>=3.5
+pillow>=9.0.0
+
+# OpenAI client library for API access
+openai>=0.28.0,<0.29
+
+# Note: tkinter is part of the Python stdlib on Linux;
+# install via apt: sudo apt install python3-tk
