@@ -1,0 +1,78 @@
+Sure! Below is a heavily commented version of the provided code:
+
+```python
+# Import the necessary modules
+import csv  # To handle CSV file reading and writing
+from document_store import DocumentStore  # Importing the DocumentStore class from the document_store module
+
+def import_loose_csv(csv_file, db_file="storage/documents.db", skipped_file="skipped_rows.csv"):
+    """
+    Imports documents from a CSV file into a document store database.
+    
+    Parameters:
+    - csv_file: The path to the CSV file to import.
+    - db_file: The path to the database file (default is "storage/documents.db").
+    - skipped_file: The path to the CSV file where skipped rows will be saved (default is "skipped_rows.csv").
+    """
+    
+    # Create an instance of DocumentStore with the specified database file
+    store = DocumentStore(db_file)
+    
+    # Initialize counters for added and skipped documents
+    added = 0
+    skipped = 0
+    
+    # List to keep track of rows that were skipped during import
+    skipped_rows = []
+
+    # Open the CSV file for reading
+    with open(csv_file, "r", newline='', encoding='utf-8') as f:
+        # Create a CSV reader object
+        reader = csv.reader(f)
+        
+        # Clear the existing documents in the database
+        store.conn.execute("DELETE FROM documents")
+        
+        # Iterate through each row in the CSV file
+        for i, row in enumerate(reader):
+            # Check if the current row has at least 3 columns and the second and third columns are not empty
+            if len(row) >= 3 and row[1].strip() and row[2].strip():
+                # If valid, add the document to the store
+                store.add_document(row[1].strip(), row[2].strip())
+                added += 1  # Increment the added counter
+            else:
+                # If the row is invalid, print a warning and add the row to the skipped list
+                print(f"⚠️ Skipping row {i + 1}: {row}")
+                skipped_rows.append(row)
+                skipped += 1  # Increment the skipped counter
+
+    # Close the document store connection
+    store.close()
+
+    # If there are any skipped rows, write them to the skipped_file
+    if skipped_rows:
+        with open(skipped_file, "w", newline='', encoding='utf-8') as f:
+            # Create a CSV writer object
+            writer = csv.writer(f)
+            # Write all skipped rows to the skipped file
+            writer.writerows(skipped_rows)
+        
+        # Print a message indicating the number of skipped rows
+        print(f"⚠️ {skipped} rows skipped and saved to '{skipped_file}'")
+
+    # Print a summary of the import process
+    print(f"✅ Import complete: {added} rows added, {skipped} rows skipped.")
+
+# Entry point of the script
+if __name__ == "__main__":
+    # Call the import_loose_csv function with the path to the input CSV file
+    import_loose_csv("documents.csv")
+```
+
+### Key Points Explained:
+1. **Imports**: The code imports the `csv` module for CSV file operations and a `DocumentStore` class to handle database operations.
+2. **Function Definition**: The `import_loose_csv` function handles the CSV import process, taking parameters for the source CSV file and optional paths for the database and skipped rows file.
+3. **DocumentStore Initialization**: An instance of `DocumentStore` is created to interact with the database.
+4. **Row Processing**: Each row of the CSV is checked to ensure it meets specific criteria (i.e., at least three columns, and the second and third columns must not be empty). Valid rows are added to the database, while invalid rows are logged for later review.
+5. **Error Handling**: Skipped rows are saved to a separate CSV file for further analysis, and feedback is provided to the user via print statements.
+6. **Main Block**: The script runs the import function when executed as a standalone program.

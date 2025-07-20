@@ -60,6 +60,7 @@ class DemoKitGUI(tk.Tk):
         self.sidebar.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         ttk.Scrollbar(frame, orient="vertical", command=self.sidebar.yview).pack(side=tk.RIGHT, fill=tk.Y)
         self.sidebar.bind("<<TreeviewSelect>>", self._on_select)
+        self.sidebar.bind("<Delete>", lambda e: self._on_delete_clicked())
 
     def _on_select(self, event):
         sel = self.sidebar.selection()
@@ -88,6 +89,7 @@ class DemoKitGUI(tk.Tk):
         self.text.grid(row=0, column=0, sticky="nswe")
         self.text.tag_configure("link", foreground="green", underline=True)
         self.text.bind("<Button-3>", self._show_context_menu)
+        self.text.bind("<Delete>", lambda e: self._on_delete_clicked())
 
         self.img_label = tk.Label(pane)
         self.img_label.grid(row=1, column=0, sticky="ew", pady=(8,0))
@@ -96,13 +98,14 @@ class DemoKitGUI(tk.Tk):
         btns = tk.Frame(pane)
         btns.grid(row=2, column=0, sticky="we", pady=(6,0))
         acts = [("ASK",self._handle_ask),("BACK",self._go_back),
-                ("IMAGE",self._handle_image),("FLASK",self.export_and_launch_server)]
+                ("DELETE",self._on_delete_clicked),("IMAGE",self._handle_image),("FLASK",self.export_and_launch_server)]
         for i,(lbl,cmd) in enumerate(acts):
             ttk.Button(btns, text=lbl, command=cmd).grid(row=0, column=i, sticky="we", padx=(0,4))
 
     def _build_context_menu(self):
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="ASK", command=self._handle_ask)
+        self.context_menu.add_command(label="Delete", command=self._on_delete_clicked)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Import", command=self._import_doc)
         self.context_menu.add_command(label="Export", command=self._export_doc)
@@ -251,13 +254,42 @@ class DemoKitGUI(tk.Tk):
             if fp.exists():
                 subprocess.Popen([sys.executable,str(fp)])
         threading.Thread(target=launch,daemon=True).start()
-        messagebox.showinfo("Server Started","Flask server launched at http://127.0.0.1:5000")
+        messagebox.showinfo("Server Started","Flask server launched at http://127.0.0.1:5050")
 
     def _refresh_sidebar(self):
         self.sidebar.delete(*self.sidebar.get_children())
         for doc in self.doc_store.get_document_index():
             self.sidebar.insert("","end",
                                 values=(doc["id"],doc["title"],doc["description"]))
+
+
+    def _on_delete_clicked(self):
+        """Delete the currently selected document."""
+        sel = self.sidebar.selection()
+        if not sel:
+            messagebox.showwarning("Delete", "No document selected.")
+            return
+
+        item = self.sidebar.item(sel[0])
+        try:
+            nid = int(item["values"][0])
+        except (ValueError, TypeError):
+            messagebox.showerror("Delete", "Invalid document ID.")
+            return
+
+        confirm = messagebox.askyesno("Confirm Delete", f"Delete document ID {nid}?")
+        if not confirm:
+            return
+
+        self.doc_store.delete_document(nid)
+        self._refresh_sidebar()
+        self.text.delete("1.0", tk.END)
+        self.img_label.configure(image="")
+        self.current_doc_id = None
+        self._last_pil_img = None
+        self._last_tk_img = None
+        self._image_enlarged = False
+        messagebox.showinfo("Deleted", f"Document {nid} has been deleted.")
 
     def _render_document(self, doc):
         self.text.delete("1.0",tk.END)

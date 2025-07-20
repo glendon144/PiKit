@@ -44,3 +44,10 @@ class DocumentStore:
         return cur.fetchone()
 
     # ... (add your other methods as needed)
+    def delete_document(self, doc_id: int):
+        """Permanently delete a document and commit changes."""
+        self.conn.execute(
+            "DELETE FROM documents WHERE id = ?",
+            (doc_id,)
+        )
+        self.conn.commit()
