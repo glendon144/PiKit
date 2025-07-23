@@ -31,12 +31,24 @@ class DocumentStore:
         self.conn.commit()
 
     def get_document_index(self):
-        cur = self.conn.execute("SELECT id, title, body FROM documents ORDER BY id DESC")
+        """
+        Return[{'id': .., 'title': .., 'description': ..}, ...] -
+        'description' is a 60-char preview for text docs,
+        or "[12345 bytes]" for binary (images, PDFs, ...).
+        """
+        cur = self.conn.execute(
+            "SELECT id, title, body FROM documents ORDER BY id DESC"
+        )
         result = []
         for row in cur.fetchall():
-            description = (row['body'] or "")[:60].replace("\n", " ").replace("\r", " ")
-            result.append({'id': row['id'], 'title': row['title'], 'description': description})
-            print("DEBUG: get_document_index returns:", result)
+            body = row["body"] or b""
+            if isinstance(body , bytes):
+                # binary file - show size placeholder
+                desc = f"[{len(body)} bytes]"
+            else:
+                # text - first 60 chars, single-line
+                desc = body[:60].replace("\n", " ").replace("\r", " ")
+            result.append({"id": row["id"], "title": row["title"], "description": desc})
         return result
 
     def get_document(self, doc_id):
