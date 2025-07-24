@@ -9,7 +9,7 @@ pandas>=2.0.3
 # Other dependencies
 pyserial>=3.5
 pillow>=9.0.0
-
+flask>=3.1.1
 # OpenAI client library for API access
 openai>=0.28.0,<0.29
 

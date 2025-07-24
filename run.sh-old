@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Adjust this if your project lives elsewhere
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_DIR="$PROJECT_DIR/pikit-env"
+PYTHON_BIN="$VENV_DIR/bin/python"
+
+# Sanity check
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "❌ Python virtualenv not found at $PYTHON_BIN"
+  echo "Make sure to create it with:"
+  echo "  python3.13 -m venv pikit-env"
+  exit 1
+fi
+
+# Optional: Print Python version
+echo "✅ Using Python: $($PYTHON_BIN --version)"
+
+# Launch your GUI app
+"$PYTHON_BIN" "$PROJECT_DIR/main.py"
+
