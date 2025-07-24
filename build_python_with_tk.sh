@@ -1,46 +1,72 @@
 #!/bin/bash
 set -e
 
-# Configuration
-PYTHON_VERSION=3.12.3
-INSTALL_DIR="$HOME/.pyenv/versions/$PYTHON_VERSION"
-ARCH_LIB_DIR="/usr/lib/i386-linux-gnu"
+PY_VERSION="3.12.3"
+INSTALL_PREFIX="/usr/local"
 
-echo "🔧 Installing system dependencies..."
-sudo apt-get update
-sudo apt-get install -y \
-  build-essential zlib1g-dev libncurses5-dev libgdbm-dev \
-  libnss3-dev libssl-dev libreadline-dev libffi-dev \
-  libsqlite3-dev wget curl tk-dev tcl-dev \
-  libx11-dev libxext-dev libxrender-dev libxcb1-dev libxft-dev \
-  make xz-utils
+echo "🔍 Step 1: Installing prerequisites..."
+sudo apt update
+sudo apt install -y \
+  build-essential \
+  libncursesw5-dev \
+  libreadline-dev \
+  libssl-dev \
+  libsqlite3-dev \
+  libgdbm-dev \
+  libc6-dev \
+  libbz2-dev \
+  libffi-dev \
+  zlib1g-dev \
+  liblzma-dev \
+  uuid-dev \
+  tk-dev \
+  libx11-dev \
+  libxext-dev \
+  libxrender-dev \
+  libxrandr-dev \
+  libxcursor-dev \
+  libxfixes-dev \
+  libxinerama-dev \
+  libxi-dev \
+  libgl1-mesa-dev \
+  wget \
+  curl \
+  x11-utils
 
-echo "📦 Downloading Python $PYTHON_VERSION..."
-cd ~
-wget https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tgz
-tar -xf Python-$PYTHON_VERSION.tgz
-cd Python-$PYTHON_VERSION
+echo "📦 Step 2: Downloading Python $PY_VERSION source..."
+cd /usr/src
+sudo rm -rf Python-$PY_VERSION
+sudo wget https://www.python.org/ftp/python/$PY_VERSION/Python-$PY_VERSION.tgz
+sudo tar xvf Python-$PY_VERSION.tgz
+cd Python-$PY_VERSION
 
-echo "🛠  Configuring build with tkinter support..."
-./configure \
-  --prefix="$INSTALL_DIR" \
+echo "⚙️ Step 3: Configuring build with tkinter support..."
+sudo ./configure \
   --enable-optimizations \
-  CPPFLAGS="-I/usr/include" \
-  LDFLAGS="-L$ARCH_LIB_DIR -ltk8.6 -ltcl8.6" \
-  PKG_CONFIG_PATH="$ARCH_LIB_DIR/pkgconfig"
+  --with-ensurepip=install \
+  --prefix=$INSTALL_PREFIX \
+  > configure.log 2>&1
 
-echo "🔨 Building Python (this may take several minutes)..."
-make -j$(nproc)
+if ! grep -i "using tk" configure.log; then
+  echo "❌ ERROR: Tkinter support not detected during configure. Check for tk.h."
+  echo "🔍 Try: 'dpkg -L tk-dev | grep tk.h' to verify tk headers exist."
+  exit 1
+fi
 
-echo "📥 Installing Python to $INSTALL_DIR..."
-make install
+echo "🧱 Step 4: Building Python (this may take a while)..."
+sudo make -j$(nproc) > build.log 2>&1
 
-echo "🔁 Setting pyenv to use $PYTHON_VERSION..."
-pyenv rehash
-pyenv global "$PYTHON_VERSION"
+echo "📥 Step 5: Installing Python $PY_VERSION..."
+sudo make altinstall
 
-echo "🧪 Testing tkinter support..."
-python -m tkinter
+echo "✅ Step 6: Verifying tkinter support..."
+PYBIN="$INSTALL_PREFIX/bin/python${PY_VERSION%.*}"
 
-echo "✅ DONE! You should see a test GUI window."
-
+if ! "$PYBIN" -c "import tkinter; print('Tkinter OK')" 2>/dev/null; then
+  echo "❌ Tkinter not available in $PYBIN"
+  echo "📄 Check logs: configure.log and build.log"
+  exit 1
+else
+  echo "🎉 SUCCESS: $PYBIN has tkinter support."
+  "$PYBIN" -m tkinter
+fi

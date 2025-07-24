@@ -6,12 +6,36 @@ from pathlib import Path
 from PIL import ImageTk, Image
 from modules import hypertext_parser, image_generator
 from modules.logger import Logger
+from tkinter import filedialog,messagebox
+from modules.directory_import import import_text_files_from_directory
 import subprocess
 import sys
 import json
 
 class DemoKitGUI(tk.Tk):
     """DemoKit GUI – ASK / IMAGE / BACK buttons, context menu, image overlay, and history."""
+
+    def _looks_like_image(self, title: str) -> bool:
+        return title.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))
+
+    def _show_image_bytes(self, raw: bytes):
+        from io import BytesIO
+        pil = Image.open(BytesIO(raw))
+        w, h = max(100, self.winfo_width()-40), max(100, self.winfo_height()-40)
+        pil.thumbnail((w, h))
+        self._tk_img = ImageTk.PhotoImage(pil)
+        if not hasattr(self, '_img_label'):
+            self._img_label = tk.Label(self, bg='black')
+        self._img_label.configure(image=self._tk_img)
+        if self.text.winfo_manager():
+            self.text.pack_forget()
+        self._img_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def _hide_image(self):
+        if hasattr(self, '_img_label') and self._img_label.winfo_manager():
+            self._img_label.pack_forget()
+        if not self.text.winfo_manager():
+            self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
     SIDEBAR_WIDTH = 320
 
@@ -60,6 +84,8 @@ class DemoKitGUI(tk.Tk):
         self.sidebar.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         ttk.Scrollbar(frame, orient="vertical", command=self.sidebar.yview).pack(side=tk.RIGHT, fill=tk.Y)
         self.sidebar.bind("<<TreeviewSelect>>", self._on_select)
+        self.sidebar.bind("<Delete>", lambda e: self._on_delete_clicked())
+        #self.sidebar_menu.add_command(label="Import Folder...", command=self._import_directory)
 
     def _on_select(self, event):
         sel = self.sidebar.selection()
@@ -88,6 +114,7 @@ class DemoKitGUI(tk.Tk):
         self.text.grid(row=0, column=0, sticky="nswe")
         self.text.tag_configure("link", foreground="green", underline=True)
         self.text.bind("<Button-3>", self._show_context_menu)
+        self.text.bind("<Delete>", lambda e: self._on_delete_clicked())
 
         self.img_label = tk.Label(pane)
         self.img_label.grid(row=1, column=0, sticky="ew", pady=(8,0))
@@ -96,13 +123,16 @@ class DemoKitGUI(tk.Tk):
         btns = tk.Frame(pane)
         btns.grid(row=2, column=0, sticky="we", pady=(6,0))
         acts = [("ASK",self._handle_ask),("BACK",self._go_back),
-                ("IMAGE",self._handle_image),("FLASK",self.export_and_launch_server)]
+                ("DELETE",self._on_delete_clicked),("IMAGE",self._handle_image),("FLASK",self.export_and_launch_server),
+("DIR IMPORT",self._import_directory),
+        ]
         for i,(lbl,cmd) in enumerate(acts):
             ttk.Button(btns, text=lbl, command=cmd).grid(row=0, column=i, sticky="we", padx=(0,4))
 
     def _build_context_menu(self):
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="ASK", command=self._handle_ask)
+        self.context_menu.add_command(label="Delete", command=self._on_delete_clicked)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Import", command=self._import_doc)
         self.context_menu.add_command(label="Export", command=self._export_doc)
@@ -130,6 +160,10 @@ class DemoKitGUI(tk.Tk):
             link_md = f"[{selected_text}](doc:{nid})"
             self.text.insert(start, link_md)
             full = self.text.get("1.0",tk.END)
+            # ---- if body is bytes and not an image, show placeholder instead of parsing ----
+            if isinstance(doc["body"], bytes):
+                self.text.insert(tk.END, "[binary document]")
+                return
             hypertext_parser.parse_links(self.text, full, self._on_link_click)
         prefix = simpledialog.askstring("Prefix","Optional prefix:",initialvalue="Please expand:")
         self.processor.query_ai(selected_text, cid, on_success, lambda *_:None,
@@ -210,9 +244,9 @@ class DemoKitGUI(tk.Tk):
         path=filedialog.askopenfilename(title="Import",filetypes=[("Text","*.txt"),("All","*.*")])
         if not path:
             return
-        content=Path(path).read_text(encoding="utf-8")
+        body=Path(path).read_text(encoding="utf-8")
         title=Path(path).stem
-        nid=self.doc_store.add_document(title,content)
+        nid=self.doc_store.add_document(title,body)
         self.logger.info(f"Imported {nid}")
         self._refresh_sidebar()
         doc=self.doc_store.get_document(nid)
@@ -236,7 +270,16 @@ class DemoKitGUI(tk.Tk):
             return
         Path(path).write_text(doc["body"],encoding="utf-8")
         messagebox.showinfo("Export",f"Saved to:\n{path}")
+    def _import_directory(self):
+        dir_path = filedialog.askdirectory(title="Select Folder to Import")
+        if not dir_path:
+            return
 
+        imported, skipped = import_text_files_from_directory(dir_path, self.doc_store)
+        msg = f"Imported {imported} file(s), skipped {skipped}."
+        print("[INFO]", msg)
+        messagebox.showinfo("Directory Import", msg)
+        self._refresh_sidebar()
     def export_and_launch_server(self):
         export_path=Path("exported_docs")
         export_path.mkdir(exist_ok=True)
@@ -251,13 +294,45 @@ class DemoKitGUI(tk.Tk):
             if fp.exists():
                 subprocess.Popen([sys.executable,str(fp)])
         threading.Thread(target=launch,daemon=True).start()
-        messagebox.showinfo("Server Started","Flask server launched at http://127.0.0.1:5000")
+        messagebox.showinfo("Server Started","Flask server launched at http://127.0.0.1:5050")
 
     def _refresh_sidebar(self):
         self.sidebar.delete(*self.sidebar.get_children())
         for doc in self.doc_store.get_document_index():
             self.sidebar.insert("","end",
                                 values=(doc["id"],doc["title"],doc["description"]))
+
+
+    def _on_delete_clicked(self):
+        """Delete the currently selected document."""
+        sel = self.sidebar.selection()
+        if not sel:
+            messagebox.showwarning("Delete", "No document selected.")
+            return
+
+        item = self.sidebar.item(sel[0])
+        try:
+            nid = int(item["values"][0])
+        except (ValueError, TypeError):
+            messagebox.showerror("Delete", "Invalid document ID.")
+            return
+
+        confirm = messagebox.askyesno("Confirm Delete", f"Delete document ID {nid}?")
+        if not confirm:
+            return
+
+        self.doc_store.delete_document(nid)
+        self._refresh_sidebar()
+        self.text.delete("1.0", tk.END)
+        body = doc["body"]
+
+
+        self.img_label.configure(image="")
+        self.current_doc_id = None
+        self._last_pil_img = None
+        self._last_tk_img = None
+        self._image_enlarged = False
+        messagebox.showinfo("Deleted", f"Document {nid} has been deleted.")
 
     def _render_document(self, doc):
         self.text.delete("1.0",tk.END)
@@ -266,6 +341,17 @@ class DemoKitGUI(tk.Tk):
         self._last_tk_img=None
         self._image_enlarged=False
         body=doc.get("body") if isinstance(doc,dict) else doc[2]
+
+        # Guard 1: bytes
+        if isinstance(body, bytes):
+            self.text.insert(tk.END, "[binary document]")
+            return
+
+        # Guard 2 : gigantic strings (e.g., .tar decoded as latin-1)
+        if len(body) > 200_000:     # threshold
+            self.text.insert(tk.END, "[large binary-like document]")
+            return
+
         self.text.insert(tk.END,body)
         hypertext_parser.parse_links(self.text,body,self._on_link_click)
 
