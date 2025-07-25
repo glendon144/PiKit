@@ -161,6 +161,7 @@ class DemoKitGUI(tk.Tk):
             self.text.insert(start, link_md)
             full = self.text.get("1.0",tk.END)
             # ---- if body is bytes and not an image, show placeholder instead of parsing ----
+            doc = self.doc_store.get_document(nid)
             if isinstance(doc["body"], bytes):
                 self.text.insert(tk.END, "[binary document]")
                 return
