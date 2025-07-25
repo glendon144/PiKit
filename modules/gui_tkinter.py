@@ -280,21 +280,24 @@ class DemoKitGUI(tk.Tk):
         print("[INFO]", msg)
         messagebox.showinfo("Directory Import", msg)
         self._refresh_sidebar()
+    
     def export_and_launch_server(self):
-        export_path=Path("exported_docs")
+        export_path = Path("exported_docs")
         export_path.mkdir(exist_ok=True)
+
         for doc in self.doc_store.get_document_index():
-            data=self.doc_store.get_document(doc["id"])
+            data = dict(self.doc_store.get_document(doc["id"]))
             if data:
-                out={"id":data["id"],"title":data["title"],"body":data["body"]}
-                with open(export_path/f"{data['id']}.json","w",encoding="utf-8") as f:
-                    json.dump(out, f, indent=2)
+                data = sanitize_doc(data)
+                with open(export_path / f"{data['id']}.json", "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+
         def launch():
-            fp=Path("modules")/"flask_server.py"
+            fp = Path("modules") / "flask_server.py"
             if fp.exists():
-                subprocess.Popen([sys.executable,str(fp)])
-        threading.Thread(target=launch,daemon=True).start()
-        messagebox.showinfo("Server Started","Flask server launched at http://127.0.0.1:5050")
+                subprocess.Popen([sys.executable, str(fp)])
+        threading.Thread(target=launch, daemon=True).start()
+        messagebox.showinfo("Server Started", "Flask server launched at http://127.0.0.1:5050")
 
     def _refresh_sidebar(self):
         self.sidebar.delete(*self.sidebar.get_children())
@@ -362,3 +365,12 @@ class DemoKitGUI(tk.Tk):
         doc=self.doc_store.get_document(doc_id)
         if doc:
             self._render_document(doc)
+
+
+def sanitize_doc(doc):
+    if isinstance(doc["body"], bytes):
+        try:
+            doc["body"] = doc["body"].decode("utf-8")
+        except UnicodeDecodeError:
+            doc["body"] = doc["body"].decode("utf-8", errors="replace")
+    return doc
