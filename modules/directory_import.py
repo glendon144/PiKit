@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 import os
 from pathlib import Path
 
@@ -38,7 +37,6 @@ def import_text_files_from_directory(directory: str, doc_store, skip_existing=Tr
 
     return imported, skipped
 
-=======
 
 import os, mimetypes
 
