@@ -9,6 +9,20 @@ import sys
 import json
 import re
 import xml.etree.ElementTree as ET
+import webbrowser, socket, subprocess, sys, os
+from pathlib import Path
+
+FLASK_HOST = "127.0.0.1"
+FLASK_PORT = 5050
+FLASK_URL  = f"http://{FLASK_HOST}:{FLASK_PORT}/"
+
+def _is_port_open(host, port):
+    try:
+        with socket.create_connection((host, port), timeout=0.35):
+            return True
+    except OSError:
+        return False
+
 
 # PiKit modules
 from modules import hypertext_parser, image_generator, document_store
@@ -601,24 +615,106 @@ class DemoKitGUI(tk.Tk):
         print("[INFO]", msg)
         messagebox.showinfo("Directory Import", msg)
         self._refresh_sidebar()
-
     def export_and_launch_server(self):
-        export_path = Path("exported_docs")
-        export_path.mkdir(exist_ok=True)
-        for doc in self.doc_store.get_document_index():
-            data = dict(self.doc_store.get_document(doc["id"]))
-            if data:
+        """Export documents to JSON and ensure the Flask server is running on 5050, then open browser."""
+        try:
+            # 1) Export current docs for the Flask UI to consume
+            export_path = Path("exported_docs")
+            export_path.mkdir(exist_ok=True)
+
+            for doc in self.doc_store.get_document_index():
+                data = dict(self.doc_store.get_document(doc["id"]))
+                if not data:
+                    continue
                 data = sanitize_doc(data)
+
+                # --- BEGIN image helpers (scoped to this method) ---
+                def _is_binary_like(s: str) -> bool:
+                    # treat as binary-like if too many non-printables in first 1KB
+                    nonprint = sum(1 for ch in s[:1024] if ord(ch) < 9 or (13 < ord(ch) < 32))
+                    return nonprint > 50
+
+                def _guess_image_ext_from_header(b: bytes) -> str | None:
+                    if b.startswith(b"\x89PNG"):
+                        return ".png"
+                    if b.startswith(b"\xff\xd8"):
+                        return ".jpg"
+                    if b.startswith(b"GIF8"):
+                        return ".gif"
+                    return None
+                # --- END image helpers ---
+
+                # Heuristics to convert binary-ish docs into image files and rewrite body
+                body = data.get("body") or ""
+
+                # Case A: body already a data URI -> leave it; Flask will render it
+                if isinstance(body, str) and body.startswith("data:image/"):
+                    pass
+                else:
+                    # Case B: exporter stored raw bytes separately as base64
+                    b64 = data.get("binary_base64")
+                    raw_bytes = None
+                    if b64:
+                        try:
+                            import base64
+                            raw_bytes = base64.b64decode(b64, validate=False)
+                        except Exception:
+                            raw_bytes = None
+
+                    # Case C: body is suspiciously binary-like text
+                    if raw_bytes is None and isinstance(body, str) and body:
+                        if _is_binary_like(body):
+                            try:
+                                import base64
+                                raw_bytes = base64.b64decode(body, validate=False)
+                            except Exception:
+                                raw_bytes = None
+
+                    # If we recovered bytes, write an image file and point body to it
+                    if raw_bytes:
+                        ext = _guess_image_ext_from_header(raw_bytes) or ".bin"
+                        img_name = f"{data['id']}{ext}"
+                        with open(export_path / img_name, "wb") as out:
+                            out.write(raw_bytes)
+                        title = data.get("title") or f"doc-{data['id']}"
+                        data["body"] = f"![{title}]({img_name})"
+
                 with open(export_path / f"{data['id']}.json", "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
 
-        def launch():
-            fp = Path("modules") / "flask_server.py"
-            if fp.exists():
-                subprocess.Popen([sys.executable, str(fp)])
+            # 2) Resolve paths relative to the repository, not CWD
+            repo_root = Path(__file__).resolve().parent.parent         # <repo>/
+            fp = Path(__file__).resolve().parent / "flask_server.py"   # <repo>/modules/flask_server.py
 
-        threading.Thread(target=launch, daemon=True).start()
-        messagebox.showinfo("Server Started", "Flask server launched at http://127.0.0.1:5050")
+            # 3) Start Flask if it's not already listening on 5050
+            if not _is_port_open(FLASK_HOST, FLASK_PORT):
+                if not fp.exists():
+                    messagebox.showerror("Flask Launch", f"Cannot find {fp}")
+                    return
+                try:
+                    subprocess.Popen(
+                        [sys.executable, str(fp)],
+                        cwd=str(repo_root),          # run from repo root so relative paths work
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception as e:
+                    messagebox.showerror("Flask Launch Error", str(e))
+                    return
+
+                # brief wait so first-time startup has a moment to bind
+                for _ in range(10):
+                    if _is_port_open(FLASK_HOST, FLASK_PORT):
+                        break
+                    self.update_idletasks()
+                    self.after(100)
+
+            # 4) Open in browser and notify
+            webbrowser.open(FLASK_URL)
+            messagebox.showinfo("Server Started", f"Flask server launched at {FLASK_URL}")
+
+        except Exception as e:
+            messagebox.showerror("Flask Launch Error", str(e))
 
     def _save_binary_as_text(self):
         selected_item = self.sidebar.selection()
