@@ -1,0 +1,276 @@
+Great start. Below is a fuller blueprint you can hand to contributors and implement incrementally. It keeps the “core ↔ adapters ↔ ui” separation strict, defines stable IDs and events, and outlines how commands, undo, storage, and search fit together.
+
+Expanded package layout
+- pikit/
+  - core/
+    - model/
+      - outline.py (tree structure, node ops, selection)
+      - document.py (document lifecycle, metadata)
+      - buffer.py (text buffer abstraction and edits)
+      - selection.py (single/multi selection, caret/anchor)
+    - commands/
+      - registry.py (registration, lookup, enablement)
+      - command.py (Command ABC, CommandContext)
+      - undo.py (UndoManager, Transaction, Operation)
+      - builtins.py (basic editing, outline, nav commands)
+    - storage/
+      - interface.py (Storage API)
+      - json_store.py (JSON implementation)
+      - schema.py (serialized forms, validation)
+      - migrations.py (versioned upgrades)
+    - eventbus.py (subscribe/publish, batching, scopes)
+    - search.py (indexing, queries, results)
+    - types.py (NodeID, DocID, Position, Range, ChangeSpan, Fields, Result types)
+    - services.py (settings, recent files, clipboard abstraction)
+    - errors.py (exception types)
+  - ui/
+    - tk/
+      - app.py (AppUI impl, composition root)
+      - outline_view.py
+      - editor_view.py
+      - status_bar.py
+      - keymap.py (platform-specific defaults)
+    - qt/
+      - app.py
+      - outline_model.py (Qt model for tree)
+      - views.py (tree, editor, status)
+      - keymap.py
+    - common/
+      - theming.py
+      - icons.py
+  - adapters/
+    - view_api.py (protocols/ABCs for OutlineView, EditorView, AppUI)
+    - headless/
+      - app.py, outline_view.py, editor_view.py (for tests/CI)
+  - plugins/
+    - __init__.py
+    - examples/ (sample command, storage, search plugins)
+  - cli/
+    - pikit.py (open, convert, inspect)
+  - config/
+    - keymaps/
+      - default.json
+      - mac.json, win.json, linux.json
+    - settings.schema.json
+  - tests/
+    - unit/ (model, commands, storage, search, eventbus)
+    - integration/ (headless adapter)
+    - property/ (buffer edits, undo invariants)
+    - perf/ (buffer ops, search)
+  - scripts/
+    - bench_buffers.py
+    - migrate_docs.py
+    - lint_all.sh
+  - docs/
+    - architecture.md
+    - core_api.md
+    - view_api.md
+    - events.md
+    - storage_format.md
+    - commands_catalog.md
+    - contributing.md
+
+Core data types (pikit/core/types.py)
+- NodeID: str (UUID-like, stable across sessions)
+- DocID: str (content buffer id)
+- Position: { line: int, column: int } or absolute int offset (choose one; see Buffer)
+- Range: { start: Position, end: Position } or { start: int, end: int }
+- ChangeSpan: { start: int, deleted_len: int } (absolute offsets in buffer)
+- Fields: dict[str, Any] (node fields such as title, flags)
+- Selection: for outline: list[NodeID]; for editor: caret/anchor and optional ranges
+- Revision: monotonically increasing int per document/buffer
+- Timestamp: float or datetime for metadata
+
+Model responsibilities
+- outline.py
+  - Maintains tree: nodes with fields: id, parent_id, index, title, doc_id, flags (folded, checked, etc.), custom metadata
+  - Operations:
+    - insert_nodes(parent_id, index, nodes)
+    - move_nodes(node_ids, new_parent_id, new_index)
+    - remove_nodes(node_ids)
+    - set_fields(node_id, fields)
+    - get_path(node_id), children(parent_id), next_sibling(prev), etc.
+  - Emits events via EventBus and supports transactions for undo
+  - Selection:
+    - set_selection(node_ids, lead_id)
+    - get_selection()
+- buffer.py
+  - Abstracts text buffer and edits; can start with a simple gap-buffer or list-of-lines
+  - Operations:
+    - replace(span: ChangeSpan, text: str) -> new_revision
+    - insert(offset: int, text)
+    - delete(span: ChangeSpan)
+    - get_text(range or full), length()
+  - Tracks revision and can produce inverse operations for undo
+- document.py
+  - Ties outline and buffers; metadata (title, created/modified, tags)
+  - Manages mapping DocID -> Buffer
+  - Snapshot and restore for storage
+- selection.py
+  - Editor selection model: caret/anchor, multi-range optional
+  - Outline selection: ordered set with lead item
+
+Event bus (pikit/core/eventbus.py)
+- Goals: decouple core and adapters; consistent delivery order; batching; main-thread marshalling
+- API:
+  - subscribe(topic: str, handler: callable, scope: str|None = None, priority: int = 0)
+  - unsubscribe(token or handler)
+  - publish(topic: str, payload: dict, scope: str|None = None, coalesce_key: str|None = None)
+  - begin_batch(scope: str), end_batch(scope: str)
+- Semantics:
+  - In-order delivery per scope
+  - Handlers run on UI thread via adapter-provided dispatcher
+  - Batches ensure UIs coalesce multiple updates; begin/end events emitted implicitly if needed
+  - Errors in handlers are logged and don’t break other subscribers
+
+Minimal UI decoupling interfaces (pikit/adapters/view_api.py)
+- OutlineView
+  - reveal_node(node_id: NodeID)
+  - select(node_ids: list[NodeID], lead_id: NodeID|None = None)
+  - begin_batch()
+  - end_batch()
+  - Optional: scroll_to(node_id), expand(node_id), collapse(node_id)
+- EditorView
+  - set_text(text: str, revision: int)
+  - set_cursor(pos: int)
+  - highlight(ranges: list[Range], kind: str = "search")
+  - Optional: apply_incremental(change_span: ChangeSpan, inserted_text_len: int, revision: int)
+- AppUI
+  - show_status(msg: str, level: str = "info", timeout_ms: int|None = 2000)
+  - confirm(prompt: str) -> bool
+  - open_files(multi: bool = True, filters: list[str] | None = None) -> list[str]
+  - save_as(suggested_name: str | None = None, filters: list[str] | None = None) -> str | None
+  - dispatch_to_ui(fn: callable) (UI thread marshalling)
+  - prompt_input(title: str, default: str = "") -> str | None (optional)
+
+Core → UI events (topics and payloads)
+- outline/nodes_inserted
+  - parent_id: NodeID, index: int, node_ids: list[NodeID]
+- outline/nodes_moved
+  - node_ids: list[NodeID], new_parent_id: NodeID, new_index: int
+- outline/nodes_removed
+  - node_ids: list[NodeID], parent_id: NodeID, index: int
+- outline/node_changed
+  - node_id: NodeID, fields: Fields, revision: int
+- outline/selection_changed
+  - node_ids: list[NodeID], lead_id: NodeID|None
+- buffer/changed
+  - doc_id: DocID, change_span: ChangeSpan, inserted_len: int, revision: int
+- buffer/reloaded (optional)
+  - doc_id: DocID, full_text_len: int, revision: int
+- app/status (optional)
+  - message: str, level: str
+Notes:
+- All events may carry batch_id if within a batch
+- Include revision for idempotence and to discard stale updates in UI
+- For large changes, core may send full reload events instead of many granular ones; UIs should support both
+
+Commands system (pikit/core/commands)
+- Command ABC (command.py)
+  - id: str (stable, namespaced e.g., edit.copy, outline.insert_child)
+  - title: str
+  - execute(ctx: CommandContext) -> None
+  - is_enabled(ctx: CommandContext) -> bool
+- CommandContext
+  - services: access to model, selection, storage, AppUI, EventBus, UndoManager, Search
+  - args: dict[str, Any] for parameterized commands
+- Registry (registry.py)
+  - register(command: Command)
+  - get(id) -> Command
+  - list(prefix: str | None) -> list[Command]
+- Undo/redo (undo.py)
+  - Operation: do(), undo(), describe()
+  - Transaction: groups operations; nested allowed
+  - UndoManager:
+    - begin(title: str) -> txn_id
+    - end(txn_id)
+    - cancel(txn_id) (rollback)
+    - undo(), redo(), can_undo(), can_redo()
+  - Integration: model operations produce Operation objects; commands open/commit transactions as needed
+- Built-in commands (builtins.py)
+  - Outline: new_node, new_child, delete, move_up/down, promote/demote, toggle_fold
+  - Editor: insert_text, delete, cut/copy/paste, select_all
+  - Navigation: reveal_current, find_next, find_prev
+  - File: new_doc, open, save, save_as
+
+Storage (pikit/core/storage)
+- Storage interface (interface.py)
+  - load(path: str) -> DocumentSnapshot
+  - save(path: str, snapshot: DocumentSnapshot) -> None
+  - import_external(path: str, format: str) -> DocumentSnapshot (optional)
+  - export(path: str, snapshot: DocumentSnapshot, format: str) -> None (optional)
+- JSON implementation (json_store.py)
+  - Format v1:
+    - doc: { id, title, created, modified, nodes: [ { id, parent, index, title, doc_id, flags, meta }, ... ], buffers: { doc_id: { text, rev } } }
+  - schema.py for validation and migrations.py for upgrades
+
+Search (pikit/core/search.py)
+- Index types:
+  - OutlineIndex: node titles and metadata
+  - ContentIndex: buffer text (on-demand or incremental)
+- API:
+  - query(q: str, scope: str = "all" | "titles" | "content") -> list[Match]
+  - next_match(from_pos), prev_match
+  - reindex(node_ids | doc_ids | full)
+- Match: { kind: "node"|"text", node_id, doc_id|None, range|None, preview }
+
+UI implementations
+- Tk:
+  - outline_view.py: Treeview-based; subscribes to outline/* events; uses begin/end batch to suspend redraw
+  - editor_view.py: Text widget; supports incremental updates via buffer/changed
+  - keymap.py: maps platform-specific accelerators to command IDs; dispatch to registry via CommandContext
+- Qt:
+  - outline_model.py: QAbstractItemModel; emits model signals from outline events
+  - views.py: QTreeView, QPlainTextEdit subclass; coalesce edits with revision checks
+  - keymap.py: QShortcuts to commands
+
+Adapters and headless UI
+- view_api.py defines the Protocols/ABCs above; UI layers implement them
+- headless adapter implements these interfaces for tests (captures events, simulates selection/cursor)
+
+Threading and performance
+- All UI updates on UI thread: EventBus uses AppUI.dispatch_to_ui
+- Core edits may run in worker threads; publish marshaled to UI
+- Batching:
+  - Core:
+    - begin_batch("outline"); perform multiple node ops; end_batch("outline")
+  - Adapters:
+    - OutlineView.begin_batch() → suspend redraw; end_batch() → refresh once
+- Large buffer changes: prefer apply_incremental where supported; fallback to set_text
+
+Testing strategy
+- Unit:
+  - outline operations preserve tree invariants (parent/index consistency)
+  - buffer edit inverses round-trip under random sequences (property tests)
+  - undo manager handles nested transactions, coalescing
+  - event emissions: correct payloads and order
+- Integration:
+  - Headless adapter: run user-like command sequences; assert UI state through adapter API
+- Storage:
+  - Golden file round-trips; migrations maintain semantics
+- Performance:
+  - Benchmarks for buffer edits, mass insert/move in outline, search indexing
+
+Scripts and CLI
+- cli/pikit.py
+  - commands: open, convert --from json --to json, inspect --stats, validate --schema
+- scripts/bench_buffers.py: compare gap/rope/backed implementations
+- scripts/migrate_docs.py: upgrade JSON vN → vN+1
+
+Docs to include
+- Architecture overview: layers and data flow
+- Events and batching: guarantees and patterns
+- View API: exact method signatures and examples for implementers
+- Storage format: schema and versioning policy
+- Commands catalog: IDs, titles, default keybindings
+- Contributing: code style, testing, perf budgets
+
+Design notes and choices
+- IDs: use UUIDv4 strings; never recycle; stable across saves
+- Revisions: per-buffer integers; UIs drop stale updates if revision mismatch
+- Selections: outline allows multi-select; editor supports single range initially with optional multi-range later
+- Error handling: commands return errors via exceptions caught by app layer, which shows status/toast
+- Extensibility: plugins can register commands, storage handlers, search providers via entry points or plugin registry
+- Minimal viable path: start with Tk UI, JSON storage, simple buffer implementation, core events, undo, and a handful of commands. Add Qt, search indexing, and plugins later.
+
+If you want, I can generate stub files for the interfaces and core skeletons so you can start coding against them right away.

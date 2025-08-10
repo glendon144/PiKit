@@ -183,7 +183,7 @@ class DemoKitGUI(tk.Tk):
         btns.grid(row=2, column=0, sticky="we", pady=(6, 0))
         acts = [
             ("TREE", self.on_tree_button),
-            ("OPEN OPML", lambda s=self: DemoKitGUI._open_opml_from_main(s)),
+            ("OPEN OPML", lambda s=self: DemoKitGui._open_opml_from_main(s)),
             ("ASK", self._handle_ask),
             ("BACK", self._go_back),
             ("DELETE", (lambda s=self: s._on_delete_clicked())),
@@ -522,27 +522,6 @@ class DemoKitGUI(tk.Tk):
         if self.img_label and self.img_label.winfo_manager():
             self.img_label.configure(image="")
 
-    def _clear_image_ui(self):
-
-        """Hide image label and reset image state."""
-
-        try:
-
-            if hasattr(self, "img_label"):
-
-                self.img_label.configure(image="")
-
-            self._last_pil_img = None
-
-            self._last_tk_img = None
-
-            self._image_enlarged = False
-
-        except Exception:
-
-            pass
-
-
     def _toggle_image(self):
         if not self._last_pil_img:
             return
@@ -792,62 +771,30 @@ class DemoKitGUI(tk.Tk):
             messagebox.showerror("Flask Launch Error", str(e))
 
     def _save_binary_as_text(self):
-
-        sel = self.sidebar.selection()
-
-        if not sel:
-
+        selected_item = self.sidebar.selection()
+        if not selected_item:
             return
-
-        try:
-
-            doc_id = int(self.sidebar.item(sel[0], "values")[0])
-
-        except Exception:
-
+        doc_id_str = self.sidebar.item(selected_item, "values")[0]
+        if not str(doc_id_str).isdigit():
+            print(f"Warning: selected text is not a valid integer '{doc_id_str}'")
             return
-
-    
-
+        doc_id = int(doc_id_str)
         doc = self.doc_store.get_document(doc_id)
-
-        if not doc:
-
+        if not doc or len(doc) < 3:
             return
+        if isinstance(body, bytes) or ("\x00" in str(body)):
+            print("Binary detected, converting to text using render_binary_as_text.")
+            body = render_binary_as_text(body)
+            self.doc_store.update_document(doc_id, body)
+            self._render_document(self.doc_store.get_document(doc_id))
+        else:
+            print("Document is already text. Skipping overwrite.")
+        content = self.processor.get_strings_content(doc_id)
+        self.doc_store.update_document(doc_id, content)
+        doc = self.doc_store.get_document(doc_id)
+        self._render_document(doc)
 
-    
-
-        body = self._extract_body(doc)
-
-        is_binary_like = isinstance(body, (bytes, bytearray)) or (isinstance(body, str) and "\x00" in body)
-
-        if is_binary_like:
-
-            raw = body if isinstance(body, (bytes, bytearray)) else body.encode("utf-8", "ignore")
-
-            body_txt = render_binary_as_text(raw)
-
-            self.doc_store.update_document(doc_id, body_txt)
-
-    
-
-        # Optional post-process via processor (ignore errors)
-
-        try:
-
-            content = self.processor.get_strings_content(doc_id)
-
-            if content:
-
-                self.doc_store.update_document(doc_id, content)
-
-        except Exception:
-
-            pass
-
-    
-
-        self._render_document(self.doc_store.get_document(doc_id))
+    # ---------------- Open OPML (import) ----------------
 
     def _open_opml_from_main(self):
         path = filedialog.askopenfilename(
@@ -898,7 +845,6 @@ class DemoKitGUI(tk.Tk):
         return ""
 
     def _render_document(self, doc):
-        self._clear_image_ui()
         """Render a document once, parse green links, and auto-render OPML when detected."""
         # Normalize doc body safely
         try:
@@ -906,8 +852,6 @@ class DemoKitGUI(tk.Tk):
         except Exception:
             body = ""
     
-
-        self._clear_image_ui()
         # OPML auto-render
         if isinstance(body, str):
             b_norm = body.lstrip("\ufeff\r\n\t ")

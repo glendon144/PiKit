@@ -1,0 +1,80 @@
+# 1) backup
+cp modules/gui_tkinter.py modules/gui_tkinter.py.bak
+
+# 2) replace _render_document with a clean, working block
+python3 - <<'PY'
+from pathlib import Path
+import re
+
+p = Path("modules/gui_tkinter.py")
+s = p.read_text(encoding="utf-8", errors="replace")
+
+# normalize weird whitespace
+s = s.replace("\r\n","\n").replace("\r","\n").replace("\u200b","").replace("\u00A0"," ").expandtabs(4)
+
+pat = re.compile(r"(^\s*def\s+_render_document\([^\)]*\):)(.*?)(?=^\s*def\s+\w+\()", re.DOTALL|re.MULTILINE)
+
+clean = r"""
+def _render_document(self, doc):
+    """ + '"""' + r"""Render a document once, parse green links, and auto-render OPML when detected.""" + '"""' + r"""
+    # --- Normalize doc + body safely ---
+    body = ""
+    try:
+        if isinstance(doc, dict):
+            body = doc.get("body", "")
+        elif isinstance(doc, (list, tuple)) and len(doc) > 2:
+            body = doc[2]
+        else:
+            body = ""
+    except Exception:
+        body = ""
+
+    # bytes -> placeholder (for now)
+    if isinstance(body, (bytes, bytearray)):
+        self._hide_opml()
+        self.text.delete("1.0", tk.END)
+        self.text.insert(tk.END, "[binary document]")
+        return
+
+    # OPML auto-render
+    if isinstance(body, str):
+        b_norm = body.lstrip("\ufeff\r\n\t ")
+        if "<opml" in b_norm.lower():
+            self._render_opml_from_string(b_norm)
+            return
+
+    # Fallback: plain text
+    self._hide_opml()
+    self.text.delete("1.0", tk.END)
+
+    # very large text -> placeholder
+    if isinstance(body, str) and len(body) > 200_000:
+        self.text.insert(tk.END, "[large binary-like document]")
+        return
+
+    # Show body and green links
+    text_to_show = body if isinstance(body, str) else str(body or "")
+    self.text.insert(tk.END, text_to_show)
+
+    # Parse & bind green links using a callback that captures the correct self
+    try:
+        cb = (lambda doc_id, s=self: s._on_link_click(doc_id))
+        hypertext_parser.parse_links(self.text, text_to_show, cb)
+    except Exception:
+        pass
+"""
+
+m = pat.search(s)
+if not m:
+    raise SystemExit("Couldn't locate _render_document to replace.")
+s = s[:m.start()] + clean + s[m.end():]
+
+# strip trailing spaces + ensure newline
+s = "\n".join(line.rstrip() for line in s.splitlines()) + "\n"
+p.write_text(s, encoding="utf-8")
+print("Replaced _render_document successfully.")
+PY
+
+# 3) sanity check
+python3 -m tabnanny -v modules/gui_tkinter.py
+
