@@ -232,7 +232,9 @@ class App(tk.Tk):
         self.doc_store = kwargs.get("doc_store") or doc_store_pos
         self.processor = kwargs.get("processor") or processor_pos
         self.logger = getattr(self.processor, "logger", Logger() if Logger else None)
-
+        # ---------------------------------------------
+        # ECM (Emotional Context Module) initialization 
+        # ---------------------------------------------
         if (
             self.doc_store is None
             and document_store_mod
@@ -747,17 +749,22 @@ class App(tk.Tk):
                 print("render_binary_as_text failed:", e)
 
     # ---------- Commands ----------
+    # ---------- Commands ----------
+
     def _on_ask(self):
         sel = self._get_selected_text()
         if not sel.strip():
             messagebox.showinfo("ASK", "Please select some text in the document first.")
             return
 
+        # Check for processor
         if not self.processor or not hasattr(self.processor, "query_ai"):
             messagebox.showerror("ASK", "CommandProcessor.query_ai is unavailable.")
             return
 
         current_id = self.current_doc_id
+
+        # Ask user for prefix
         prefix = simpledialog.askstring(
             "ASK prefix",
             "Enter prefix (optional):",
@@ -766,23 +773,33 @@ class App(tk.Tk):
         if prefix is None:
             return
 
+        # ----------------------------------------------------
+        # Success callback
+        # ----------------------------------------------------
         def _on_success(new_id):
             try:
                 messagebox.showinfo("ASK", f"Created new document {new_id}")
             finally:
                 self._refresh_index()
 
-        def _on_link_created(_t):
-            # Re-open current doc so green link appears immediately
-            if current_id is not None and self.doc_store:
-                try:
+        # ----------------------------------------------------
+        # Link creation callback (canonical PiKit green-link path)
+        # ----------------------------------------------------
+        def _on_link_created(new_id):
+            print("DEBUG: on_link_created called with new_id =", new_id)
+            try:
+                if current_id is not None and self.doc_store:
                     doc = self.doc_store.get_document(current_id)
                     if doc:
+                        # Re-render so the newly updated body (with green link)
+                        # becomes visible immediately.
                         self._render_document(doc)
-                except Exception as e:
-                    print("on_link_created refresh failed:", e)
+            except Exception as e:
+                print("on_link_created error:", e)
 
-        # Try 5-arg signature first, then legacy 4-arg
+        # ----------------------------------------------------
+        # Main AI call (new-style, with prefix + callbacks)
+        # ----------------------------------------------------
         try:
             self.processor.query_ai(
                 selected_text=sel,
@@ -792,6 +809,7 @@ class App(tk.Tk):
                 prefix=prefix,
             )
         except TypeError:
+            # Legacy 4-arg signature
             try:
                 self.processor.query_ai(sel, current_id, _on_success, _on_link_created)
             except Exception as e:
