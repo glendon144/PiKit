@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WWII Oscilloscope Stock Ticker</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="console">
+      <header class="panel-header">
+        <h1>Signal Corps Market Scope</h1>
+        <p>WWII-style stock ticker visualization terminal</p>
+      </header>
+
+      <section class="controls" aria-label="Chart controls">
+        <label>
+          Ticker
+          <select id="tickerSelect">
+            <option>AAPL</option>
+            <option>MSFT</option>
+            <option>NVDA</option>
+            <option>TSLA</option>
+            <option>SPY</option>
+          </select>
+        </label>
+
+        <label>
+          Add Symbol
+          <div class="symbol-entry">
+            <input id="symbolInput" type="text" maxlength="8" placeholder="e.g. AMZN" />
+            <button id="addSymbolButton" type="button">Tune</button>
+          </div>
+        </label>
+
+        <label>
+          Timebase
+          <select id="timebaseSelect">
+            <option value="24">1 Day</option>
+            <option value="120">1 Week</option>
+            <option value="260">1 Month</option>
+            <option value="390">3 Months</option>
+            <option value="520" selected>1 Year</option>
+          </select>
+        </label>
+
+        <label>
+          Timebase Fine Tune
+          <input id="timebaseKnob" type="range" min="24" max="520" value="520" step="1" />
+        </label>
+      </section>
+
+      <section class="crt-shell">
+        <div class="crt-bezel">
+          <canvas id="scope" width="980" height="420" aria-label="Stock chart oscilloscope display"></canvas>
+          <div class="scanline-overlay" aria-hidden="true"></div>
+          <div class="vignette-overlay" aria-hidden="true"></div>
+        </div>
+      </section>
+
+      <footer class="status-strip">
+        <span id="statusTicker">Ticker: AAPL</span>
+        <span id="statusTimebase">Timebase: 1 Year</span>
+        <span id="statusPrice">Signal: --</span>
+      </footer>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
