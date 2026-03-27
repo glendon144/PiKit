@@ -57,8 +57,26 @@ class AIInterface:
                  base_url: Optional[str] = None,
                  model: Optional[str] = None,
                  timeout: Optional[float] = None):
+        resolved_api_key = api_key or os.getenv("BASETEN_API_KEY")
+        self.base_url = base_url or DEFAULT_BASE_URL
         self.model = model or DEFAULT_MODEL
-        self.client = _mk_client(api_key=api_key, base_url=base_url, timeout=timeout)
+        self.timeout = timeout or DEFAULT_TIMEOUT
+        self._has_api_key = bool(resolved_api_key)
+        self.client = _mk_client(
+            api_key=resolved_api_key,
+            base_url=self.base_url,
+            timeout=self.timeout,
+        )
+
+    def get_config(self) -> dict:
+        """Return a small runtime snapshot for launcher/debug scripts."""
+        return {
+            "base_url": self.base_url,
+            "model": self.model,
+            "timeout": self.timeout,
+            "provider": "baseten-openai-compatible",
+            "has_api_key": self._has_api_key,
+        }
 
     # ---------- Core methods ----------
 
