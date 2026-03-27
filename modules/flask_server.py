@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 from urllib.parse import urlencode, quote
 
 DATA_DIR = Path(__file__).parent.parent / "exported_docs"
+SHARE_DIR = DATA_DIR / "_shares"
 ASSETS_DIR = DATA_DIR / "assets"  # optional: holds *.b64 files
 TOKEN_FILE = Path(__file__).parent.parent / "storage" / "pikit_api_token.txt"
 DEFAULT_CERT = Path(__file__).parent.parent / "storage" / "pikit.crt"
@@ -93,6 +94,12 @@ def _find_doc(doc_id: str) -> Optional[Dict[str, Any]]:
     if isinstance(root, list):
         return next((d for d in root if _s(d.get("id")) == doc_id), None)
     return None
+
+
+def _load_share(share_id: str) -> Optional[Dict[str, Any]]:
+    fp = SHARE_DIR / f"{share_id}.json"
+    obj = _load_json(fp)
+    return obj if isinstance(obj, dict) else None
 
 
 def _is_image_dict(d: Dict[str, Any]) -> bool:
@@ -299,6 +306,13 @@ def create_app():
             if len(results) >= limit:
                 break
         return jsonify({"query": query, "limit": limit, "results": results})
+
+    @app.route("/share/<share_id>")
+    def shared_doc(share_id: str):
+        shared = _load_share(_s(share_id))
+        if not shared:
+            abort(404)
+        return jsonify(shared)
 
     @app.route("/")
     def index():
@@ -566,6 +580,7 @@ def create_app():
 if __name__ == "__main__":
     debug = os.environ.get("FLASK_DEBUG") == "1"
     port = int(os.environ.get("PORT", "5050"))
+    host = os.environ.get("PIKIT_FLASK_HOST", "127.0.0.1")
     cert = Path(os.environ.get("PIKIT_CERT", str(DEFAULT_CERT)))
     key = Path(os.environ.get("PIKIT_KEY", str(DEFAULT_KEY)))
 
@@ -577,4 +592,4 @@ if __name__ == "__main__":
         print("[flask_server] TLS cert/key not found; starting HTTP on localhost only", file=sys.stderr)
 
     app = create_app()
-    app.run(host="127.0.0.1", port=port, debug=debug, ssl_context=ssl_context)
+    app.run(host=host, port=port, debug=debug, ssl_context=ssl_context)

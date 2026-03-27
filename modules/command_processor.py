@@ -1,13 +1,17 @@
 # PiKit Command Processor (updated with memory preamble + truncation + adaptive length)
 from __future__ import annotations
 
+import base64
+import json
 import os
+import secrets
 import time
 from pathlib import Path
 from typing import Any, Tuple
 
 from modules.logger import Logger
 from modules.document_store import DocumentStore
+from modules.document_transfer import DEFAULT_FLASK_PORT
 from modules.directory_import import import_text_files_from_directory
 from modules.ai_memory import get_memory, set_memory
 from modules.text_sanitizer import sanitize_ai_reply
@@ -138,6 +142,88 @@ class CommandProcessor:
             "Import CSV": self.doc_store.import_csv,
             "Export CSV": self.doc_store.export_csv,
         }
+
+    def _share_dir(self) -> Path:
+        path = Path("exported_docs") / "_shares"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _build_shared_payload(self, doc_id: int) -> dict[str, Any]:
+        row = self.doc_store.get_document(doc_id)
+        if not row:
+            raise ValueError(f"Document {doc_id} not found.")
+
+        actual_id, title, body = _normalize_row(row)
+        if actual_id is None:
+            actual_id = doc_id
+
+        payload: dict[str, Any] = {
+            "doc_id": int(actual_id),
+            "title": title or f"Document {actual_id}",
+            "shared_at": int(time.time()),
+        }
+        if isinstance(body, (bytes, bytearray)):
+            payload["body_encoding"] = "base64"
+            payload["body"] = base64.b64encode(bytes(body)).decode("ascii")
+        else:
+            payload["body_encoding"] = "text"
+            payload["body"] = "" if body is None else str(body)
+        return payload
+
+    def send_document(
+        self,
+        doc_id: int,
+        recipient_host: str,
+        recipient_port: int,
+        sender_host: str,
+        sender_name: str | None = None,
+        flask_port: int = DEFAULT_FLASK_PORT,
+        share_scheme: str = "https",
+    ) -> dict[str, Any]:
+        if not recipient_host.strip():
+            raise ValueError("Recipient host is required.")
+        if not sender_host.strip():
+            raise ValueError("Sender host is required.")
+
+        share_id = secrets.token_urlsafe(18)
+        shared_payload = self._build_shared_payload(int(doc_id))
+        shared_payload["share_id"] = share_id
+
+        share_file = self._share_dir() / f"{share_id}.json"
+        share_file.write_text(
+            json.dumps(shared_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        sender_label = sender_name or os.getenv("USER") or "PiKit user"
+        return {
+            "kind": "document_share_invite",
+            "share_id": share_id,
+            "doc_id": shared_payload["doc_id"],
+            "doc_title": shared_payload["title"],
+            "sender_name": sender_label,
+            "sender_host": sender_host,
+            "sender_flask_port": int(flask_port),
+            "share_scheme": share_scheme,
+            "recipient_host": recipient_host.strip(),
+            "recipient_port": int(recipient_port),
+            "share_url": f"{share_scheme}://{sender_host}:{int(flask_port)}/share/{share_id}",
+            "sent_at": int(time.time()),
+        }
+
+    def import_shared_document(self, shared_payload: dict[str, Any]) -> int:
+        title = str(shared_payload.get("title") or "Shared Document")
+        encoding = str(shared_payload.get("body_encoding") or "text")
+        raw_body = shared_payload.get("body")
+
+        if encoding == "base64":
+            if not isinstance(raw_body, str):
+                raise ValueError("Shared binary document payload is invalid.")
+            body = base64.b64decode(raw_body.encode("ascii"))
+        else:
+            body = "" if raw_body is None else str(raw_body)
+
+        return self.doc_store.add_document(title, body)
 
     # ----------------- Core prompting -----------------
 
