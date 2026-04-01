@@ -7,7 +7,7 @@ import os
 import secrets
 import time
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Tuple, Callable
 
 from modules.logger import Logger
 from modules.document_store import DocumentStore
@@ -88,6 +88,24 @@ class CommandProcessor:
         self.doc_store = store
         self.ai = ai_interface
         self.logger = logger if logger else Logger()
+        self.dream_handler: Callable[..., None] | None = None
+
+    def set_dream_handler(self, handler: Callable[..., None] | None) -> None:
+        """Register a callback for lightweight Dream-mode event logging."""
+        self.dream_handler = handler
+
+    def _emit_dream_event(self, event_type: str, content: str, **metadata) -> None:
+        if not self.dream_handler:
+            return
+        try:
+            self.dream_handler(event_type=event_type, content=content, metadata=metadata)
+        except TypeError:
+            try:
+                self.dream_handler(event_type, content, metadata)
+            except Exception as e:
+                self.logger.info(f"Dream handler failed (non-fatal): {e}")
+        except Exception as e:
+            self.logger.info(f"Dream handler failed (non-fatal): {e}")
 
     # --------------- Memory helpers ---------------
 
@@ -268,6 +286,11 @@ class CommandProcessor:
             response = sanitize_ai_reply(response)
             self.logger.info("AI response received successfully")
             self._update_memory_breadcrumbs(prompt)
+            self._emit_dream_event(
+                "ask_question",
+                prompt,
+                response_preview=response[:240],
+            )
             return response
         except Exception as e:
             self.logger.error(f"AI query failed: {e}")
@@ -302,6 +325,12 @@ class CommandProcessor:
         prompt = f"{prompt_core}\n\n{steer}"
 
         self.logger.info(f"Sending prompt: max_tokens={max_toks} | {prompt}")
+        self._emit_dream_event(
+            "ask_request",
+            base_prompt,
+            current_doc_id=current_doc_id,
+            prefix=prefix or "",
+        )
 
         # Call AI
         try:
@@ -320,6 +349,12 @@ class CommandProcessor:
         # Create the AI response document
         new_doc_id = self.doc_store.add_document("AI Response", reply)
         self.logger.info(f"Created new document {new_doc_id}")
+        self._emit_dream_event(
+            "ask_response",
+            reply,
+            current_doc_id=current_doc_id,
+            new_doc_id=new_doc_id,
+        )
 
         # Try to embed a green link in the original text document
         try:
@@ -363,6 +398,13 @@ class CommandProcessor:
                             self.doc_store.update_document(current_doc_id, updated)  # type: ignore
                     except Exception as e:
                         self.logger.error(f"Failed updating original doc {current_doc_id}: {e}")
+                    else:
+                        self._emit_dream_event(
+                            "link_embed",
+                            selected_text,
+                            current_doc_id=current_doc_id,
+                            new_doc_id=new_doc_id,
+                        )
             else:
                 # Skip binary or missing bodies
                 if isinstance(body, (bytes, bytearray)):
@@ -378,7 +420,7 @@ class CommandProcessor:
 
         # Fire UI callbacks
         try:
-            on_link_created(selected_text)
+            on_link_created(new_doc_id)
         except Exception as e:
             self.logger.info(f"on_link_created callback failed (non-fatal): {e}")
         try:

@@ -58,6 +58,7 @@ opml_plugin = _try_import("modules.opml_extras_plugin_v3")
 logger_mod = _try_import("modules.logger")
 flask_server_path = Path("modules") / "flask_server.py"
 document_transfer_mod = _try_import("modules.document_transfer")
+dream_mod = _try_import("modules.dream")
 
 # ---- Legacy/alternate module names (shims) ----
 if command_processor_mod is None:
@@ -72,6 +73,14 @@ if command_processor_mod:
         command_processor_mod,
         "CommandProcessor",
         getattr(command_processor_mod, "CmdProcessor", None),
+    )
+
+DreamProcessorClass = None
+if dream_mod:
+    DreamProcessorClass = getattr(
+        dream_mod,
+        "DreamProcessor",
+        getattr(dream_mod, "DreamEngine", None),
     )
 
 # Resolve link parser function(s)
@@ -265,6 +274,9 @@ class App(tk.Tk):
         self.doc_store = kwargs.get("doc_store") or doc_store_pos
         self.processor = kwargs.get("processor") or processor_pos
         self.logger = getattr(self.processor, "logger", Logger() if Logger else None)
+        self.dream_enabled = False
+        self.dream_processor = None
+        self.dream_db_path = Path("storage") / "dreams.db"
         # ---------------------------------------------
         # ECM (Emotional Context Module) initialization 
         # ---------------------------------------------
@@ -284,10 +296,124 @@ class App(tk.Tk):
             except Exception as e:
                 print("Warning: CommandProcessor failed to init:", e)
 
+        self._setup_dream_processor()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._start_transfer_listener()
         self._refresh_index()
+
+    def _setup_dream_processor(self):
+        if not DreamProcessorClass:
+            return
+        try:
+            self.dream_db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.dream_db_path.touch(exist_ok=True)
+
+            created = None
+            for args, kwargs in [
+                ((str(self.dream_db_path),), {"main_db_reader": self._dream_main_db_reader}),
+                ((str(self.dream_db_path),), {}),
+                ((self.doc_store,), {}),
+                ((), {}),
+            ]:
+                try:
+                    created = DreamProcessorClass(*args, **kwargs)
+                    break
+                except TypeError:
+                    continue
+
+            self.dream_processor = created
+            if self.dream_processor and hasattr(self.dream_processor, "start"):
+                self.dream_processor.start()
+            if self.dream_processor and hasattr(self.dream_processor, "authorize"):
+                self.dream_processor.authorize(False)
+            if self.processor and hasattr(self.processor, "set_dream_handler"):
+                self.processor.set_dream_handler(self._record_dream_event)
+        except Exception as e:
+            print("Warning: Dream processor failed to init:", e)
+            self.dream_processor = None
+
+    def _dream_main_db_reader(self):
+        if not self.doc_store or not hasattr(self.doc_store, "get_document_index"):
+            return ""
+        try:
+            rows = self.doc_store.get_document_index() or []
+        except Exception:
+            return ""
+        titles = []
+        for row in rows[:8]:
+            try:
+                title, _content = _extract_title_content(row)
+            except Exception:
+                title = ""
+            if title:
+                titles.append(title)
+        return "Recent documents: " + ", ".join(titles) if titles else ""
+
+    def _set_dream_button_label(self):
+        if hasattr(self, "dream_button") and self.dream_button:
+            self.dream_button.configure(text=f"Dream: {'ON' if self.dream_enabled else 'OFF'}")
+
+    def _record_dream_event(self, event_type: str, content: str, metadata: Optional[dict[str, Any]] = None):
+        if not self.dream_processor:
+            return
+        metadata = metadata or {}
+        source_doc_id = metadata.get("current_doc_id", self.current_doc_id)
+        try:
+            if hasattr(self.dream_processor, "add_event"):
+                self.dream_processor.add_event(
+                    event_type=event_type,
+                    content_snippet=str(content),
+                    source_doc_id=source_doc_id,
+                    metadata=metadata,
+                )
+            elif hasattr(self.dream_processor, "ingest_event"):
+                self.dream_processor.ingest_event(
+                    event_type=event_type,
+                    content=str(content),
+                    doc_id=source_doc_id,
+                    metadata=metadata,
+                )
+        except Exception as e:
+            print("Dream ingest error:", e)
+
+    def _toggle_dream(self):
+        if not self.dream_processor:
+            messagebox.showerror("Dream", "Dream processor is unavailable.")
+            return
+        self.dream_enabled = not self.dream_enabled
+        if hasattr(self.dream_processor, "authorize"):
+            try:
+                self.dream_processor.authorize(self.dream_enabled)
+            except Exception:
+                pass
+        self._set_dream_button_label()
+        self.status.set(
+            "Dream mode authorized for idle processing."
+            if self.dream_enabled
+            else "Dream mode disabled."
+        )
+
+    def _run_dream_now(self):
+        if not self.dream_processor:
+            messagebox.showerror("Dream", "Dream processor is unavailable.")
+            return
+        try:
+            capsule = None
+            if hasattr(self.dream_processor, "force_dream_pass"):
+                capsule = self.dream_processor.force_dream_pass()
+            elif hasattr(self.dream_processor, "process_tick"):
+                self.dream_processor.process_tick()
+                if hasattr(self.dream_processor, "get_latest_capsule"):
+                    capsule = self.dream_processor.get_latest_capsule()
+            elif hasattr(self.dream_processor, "get_latest_capsule"):
+                capsule = self.dream_processor.get_latest_capsule()
+            if not capsule:
+                capsule = "Dream pass completed."
+            messagebox.showinfo("Dream Capsule", str(capsule)[:3000])
+            self.status.set("Dream pass completed.")
+        except Exception as e:
+            messagebox.showerror("Dream", f"Dream pass failed: {e}")
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -321,6 +447,11 @@ class App(tk.Tk):
         bar.pack(side="top", fill="x")
 
         ttk.Button(bar, text="Ask", command=self._on_ask).pack(
+            side="left", padx=4, pady=4
+        )
+        self.dream_button = ttk.Button(bar, text="Dream: OFF", command=self._toggle_dream)
+        self.dream_button.pack(side="left", padx=4, pady=4)
+        ttk.Button(bar, text="Dream Now", command=self._run_dream_now).pack(
             side="left", padx=4, pady=4
         )
         ttk.Button(bar, text="Back", command=self._go_back).pack(
@@ -496,6 +627,11 @@ class App(tk.Tk):
             except Exception:
                 pass
             self._transfer_server = None
+        if self.dream_processor and hasattr(self.dream_processor, "stop"):
+            try:
+                self.dream_processor.stop()
+            except Exception:
+                pass
         self.destroy()
 
     def _start_transfer_listener(self):
@@ -869,6 +1005,7 @@ class App(tk.Tk):
 
         self.current_doc_id = doc_id
         self._render_document(doc)
+        self._record_dream_event("document_open", f"Opened document {doc_id}", {"current_doc_id": doc_id})
 
     # ---------- Render ----------
     def _looks_like_opml(self, text: str) -> bool:
@@ -1045,6 +1182,12 @@ class App(tk.Tk):
                 print("parse_links failed:", e)
 
         self.status.set(f"Viewing: {title} (id={self.current_doc_id})")
+        if isinstance(display, str):
+            self._record_dream_event(
+                "document_view",
+                display[:2000],
+                {"current_doc_id": self.current_doc_id, "title": title},
+            )
 
     def _render_binary_preview(self, payload):
         if render_binary_preview:
@@ -1090,6 +1233,11 @@ class App(tk.Tk):
         # ----------------------------------------------------
         def _on_success(new_id):
             try:
+                self._record_dream_event(
+                    "ask_success",
+                    sel,
+                    {"current_doc_id": current_id, "new_doc_id": new_id},
+                )
                 messagebox.showinfo("ASK", f"Created new document {new_id}")
             finally:
                 self._refresh_index()
@@ -1100,6 +1248,11 @@ class App(tk.Tk):
         def _on_link_created(new_id):
             print("DEBUG: on_link_created called with new_id =", new_id)
             try:
+                self._record_dream_event(
+                    "link_created",
+                    sel,
+                    {"current_doc_id": current_id, "new_doc_id": new_id},
+                )
                 if current_id is not None and self.doc_store:
                     doc = self.doc_store.get_document(current_id)
                     if doc:
@@ -1112,6 +1265,11 @@ class App(tk.Tk):
         # ----------------------------------------------------
         # Main AI call (new-style, with prefix + callbacks)
         # ----------------------------------------------------
+        self._record_dream_event(
+            "ask_selected_text",
+            sel,
+            {"current_doc_id": current_id, "prefix": prefix or ""},
+        )
         try:
             self.processor.query_ai(
                 selected_text=sel,
