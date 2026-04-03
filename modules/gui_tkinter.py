@@ -449,6 +449,9 @@ class App(tk.Tk):
         ttk.Button(bar, text="Ask", command=self._on_ask).pack(
             side="left", padx=4, pady=4
         )
+        ttk.Button(bar, text="Distill", command=self._on_distill).pack(
+            side="left", padx=4, pady=4
+        )
         self.dream_button = ttk.Button(bar, text="Dream: OFF", command=self._toggle_dream)
         self.dream_button.pack(side="left", padx=4, pady=4)
         ttk.Button(bar, text="Dream Now", command=self._run_dream_now).pack(
@@ -560,6 +563,7 @@ class App(tk.Tk):
         # Context menu
         self.context_menu = tk.Menu(root, tearoff=0)
         self.context_menu.add_command(label="Ask", command=self._on_ask)
+        self.context_menu.add_command(label="Distill", command=self._on_distill)
         self.context_menu.add_command(label="Send Current Document…", command=self._on_send_document)
         self.context_menu.add_command(
             label="Export Current…", command=self._export_current
@@ -1286,6 +1290,116 @@ class App(tk.Tk):
                 messagebox.showerror("ASK", f"query_ai failed: {e}")
         except Exception as e:
             messagebox.showerror("ASK", f"query_ai error: {e}")
+
+
+    def _on_distill(self):
+        if not self.processor or not hasattr(self.processor, "distill_text"):
+            messagebox.showerror("DISTILL", "CommandProcessor.distill_text is unavailable.")
+            return
+
+        current_id = self.current_doc_id
+        selected_text = self._get_selected_text()
+        sel_start = None
+        sel_end = None
+        source_title = "Untitled"
+        source_text = ""
+        source_doc_id = None
+
+        if selected_text.strip():
+            source_doc_id = current_id
+            source_text = selected_text
+            try:
+                start_index = self.text.index("sel.first")
+                end_index = self.text.index("sel.last")
+                sel_start = len(self.text.get("1.0", start_index))
+                sel_end = len(self.text.get("1.0", end_index))
+            except Exception:
+                sel_start = None
+                sel_end = None
+
+            try:
+                if current_id is not None and self.doc_store:
+                    doc = self.doc_store.get_document(current_id)
+                    if doc:
+                        title, _content = _extract_title_content(doc)
+                        source_title = title or "Current Document"
+            except Exception:
+                pass
+        else:
+            highlighted_id = None
+            try:
+                sel = self.sidebar.selection()
+                if sel:
+                    item = self.sidebar.item(sel[0])
+                    vals = item.get("values") or []
+                    if vals:
+                        highlighted_id = int(vals[0])
+            except Exception:
+                highlighted_id = None
+
+            chosen_id = highlighted_id if highlighted_id is not None else current_id
+            if chosen_id is not None and self.doc_store:
+                try:
+                    doc = self.doc_store.get_document(chosen_id)
+                    if doc:
+                        source_doc_id = chosen_id
+                        title, content = _extract_title_content(doc)
+                        source_title = title or f"Document {chosen_id}"
+                        source_text = content if isinstance(content, str) else str(content)
+                except Exception as e:
+                    messagebox.showerror("DISTILL", f"Could not load source document: {e}")
+                    return
+
+        if not source_text.strip():
+            messagebox.showinfo("DISTILL", "No source text available to distill.")
+            return
+
+        def _on_success(new_id):
+            try:
+                self._record_dream_event(
+                    "distill_success",
+                    source_title,
+                    {"current_doc_id": source_doc_id, "new_doc_id": new_id},
+                )
+                self._refresh_index()
+                self._open_doc_id(new_id)
+                messagebox.showinfo("DISTILL", f"Created distilled document {new_id}")
+            finally:
+                self._refresh_index()
+
+        def _on_link_created(new_id):
+            try:
+                self._record_dream_event(
+                    "distill_link_created",
+                    source_title,
+                    {"current_doc_id": source_doc_id, "new_doc_id": new_id},
+                )
+                if source_doc_id is not None and self.doc_store and source_doc_id == self.current_doc_id:
+                    doc = self.doc_store.get_document(source_doc_id)
+                    if doc:
+                        self._render_document(doc)
+            except Exception as e:
+                print("DISTILL on_link_created error:", e)
+
+        self._record_dream_event(
+            "distill_selected_text" if selected_text.strip() else "distill_document",
+            source_title,
+            {"current_doc_id": source_doc_id},
+        )
+
+        try:
+            self.processor.distill_text(
+                source_text=source_text,
+                current_doc_id=source_doc_id,
+                on_success=_on_success,
+                on_link_created=_on_link_created,
+                source_title=source_title,
+                selected_text=selected_text if selected_text.strip() else None,
+                sel_start=sel_start,
+                sel_end=sel_end,
+            )
+        except Exception as e:
+            messagebox.showerror("DISTILL", f"distill_text error: {e}")
 
     def _go_back(self):
         if not self.history:

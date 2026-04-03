@@ -486,6 +486,160 @@ class CommandProcessor:
         # Else, return text as-is
         return str(body or "")
 
+
+    def distill_text(
+        self,
+        source_text: str,
+        current_doc_id: int | None,
+        on_success,
+        on_link_created,
+        source_title: str | None = None,
+        selected_text: str | None = None,
+        sel_start: int | None = None,
+        sel_end: int | None = None,
+    ) -> None:
+        """
+        Distill source text into a compact execution brief, create a new document,
+        and optionally embed a green link back into the source document.
+        """
+        if not source_text or not str(source_text).strip():
+            self.logger.error("distill_text called with empty source_text")
+            return
+
+        source_title = source_title or "Untitled"
+        selection_label = (selected_text or "").strip()
+
+        distill_prompt = f"""Distill this material into a clean working brief that preserves both technical meaning and creative intention.
+
+Keep:
+- the real goal
+- important decisions already made
+- essential context discovered during exploration
+- constraints and exclusions
+- style / tone preferences
+- unresolved issues that still matter
+
+Discard:
+- repetition
+- dead ends
+- exploratory chatter that no longer affects the task
+- redundant explanation
+
+Output exactly in this format:
+
+PROJECT:
+GOAL:
+ESSENTIAL CONTEXT:
+DECISIONS MADE:
+CONSTRAINTS:
+STYLE / TONE:
+OPEN ISSUES:
+FINAL EXECUTION PROMPT:
+RISKS OF MISREADING:
+
+Source title: {source_title}
+
+Source material:
+{source_text}
+"""
+
+        conn = self._get_conn()
+        mem = get_memory(conn, key="global") if conn else {}
+        preamble = self._build_memory_preamble(mem, current_doc_id=current_doc_id)
+        prompt_core = (preamble + "\n\n" + distill_prompt) if preamble else distill_prompt
+
+        max_toks, steer = self._choose_length_policy(source_text)
+        prompt = f"{prompt_core}\n\nOutput: be concise, concrete, and structured."
+
+        self.logger.info(f"Sending DISTILL prompt: max_tokens={max_toks}")
+        self._emit_dream_event(
+            "distill_request",
+            source_text[:1000],
+            current_doc_id=current_doc_id,
+            source_title=source_title,
+        )
+
+        try:
+            kwargs = self._apply_overrides(prompt, max_toks)
+            try:
+                reply = self.ai.query(prompt, **kwargs)
+            except TypeError:
+                reply = self.ai.query(prompt)
+            reply = sanitize_ai_reply(reply)
+        except Exception as e:
+            self.logger.error(f"DISTILL AI query failed: {e}")
+            return
+
+        new_title = f"Distilled Brief: {source_title}"
+        new_body = f"Distilled from: {source_title}\nPurpose: execution bridge\n\n{reply}"
+        new_doc_id = self.doc_store.add_document(new_title, new_body)
+
+        self.logger.info(f"Created DISTILL document {new_doc_id}")
+        self._emit_dream_event(
+            "distill_response",
+            reply[:1000],
+            current_doc_id=current_doc_id,
+            new_doc_id=new_doc_id,
+        )
+
+        try:
+            original = self.doc_store.get_document(current_doc_id) if current_doc_id is not None else None
+        except Exception as e:
+            original = None
+            self.logger.error(f"Failed to load original doc {current_doc_id}: {e}")
+
+        if original is not None:
+            try:
+                _, _title, body = _normalize_row(original)
+            except Exception:
+                body = ""
+
+            if isinstance(body, str):
+                anchor = selection_label or f"Distilled Brief ({new_doc_id})"
+                link_md = f"[{anchor}](doc:{new_doc_id})"
+                updated = None
+
+                if (
+                    selection_label
+                    and isinstance(sel_start, int)
+                    and isinstance(sel_end, int)
+                    and 0 <= sel_start < sel_end <= len(body)
+                ):
+                    updated = body[:sel_start] + link_md + body[sel_end:]
+                    self.logger.info(f"Embedded DISTILL link at offsets {sel_start}-{sel_end}")
+                elif selection_label and selection_label in body:
+                    updated = body.replace(selection_label, link_md, 1)
+                    self.logger.info("Embedded DISTILL link by substring replace")
+                elif not selection_label:
+                    suffix = "\n\n" if body and not body.endswith("\n") else "\n"
+                    updated = body + suffix + link_md + "\n"
+                    self.logger.info("Appended DISTILL link to end of source document")
+
+                if updated is not None:
+                    try:
+                        if hasattr(self.doc_store, "update_document_body"):
+                            self.doc_store.update_document_body(current_doc_id, updated)
+                        else:
+                            self.doc_store.update_document(current_doc_id, updated)  # type: ignore[arg-type]
+                    except Exception as e:
+                        self.logger.error(f"Failed updating original doc {current_doc_id}: {e}")
+
+        try:
+            self._update_memory_breadcrumbs(f"DISTILL: {source_title}")
+        except Exception:
+            pass
+
+        try:
+            on_link_created(new_doc_id)
+        except Exception as e:
+            self.logger.info(f"on_link_created callback failed (non-fatal): {e}")
+
+        try:
+            on_success(new_doc_id)
+        except Exception as e:
+            self.logger.info(f"on_success callback failed (non-fatal): {e}")
+
+
     # --------------- Bulk imports ---------------
 
     def import_opml_from_path(self, path: str) -> int:
