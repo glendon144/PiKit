@@ -48,6 +48,7 @@ hypertext_parser_mod = _try_import("modules.hypertext_parser")
 renderer_mod = _try_import("modules.renderer")
 opml_plugin = _try_import("modules.opml_extras_plugin_v3")
 logger_mod = _try_import("modules.logger")
+ecm_dialog_mod = _try_import("modules.ecm_settings_dialog")
 flask_server_path = Path("modules") / "flask_server.py"
 
 # ---- Legacy/alternate module names (shims) ----
@@ -79,6 +80,11 @@ render_binary_as_text = getattr(renderer_mod or object(), "render_binary_as_text
 
 # Logger
 Logger = getattr(logger_mod or object(), "Logger", None)
+open_ecm_settings_dialog = getattr(
+    ecm_dialog_mod or object(),
+    "open_ecm_settings_dialog",
+    None,
+)
 
 # ---------- Helpers ----------
 
@@ -232,9 +238,7 @@ class App(tk.Tk):
         self.doc_store = kwargs.get("doc_store") or doc_store_pos
         self.processor = kwargs.get("processor") or processor_pos
         self.logger = getattr(self.processor, "logger", Logger() if Logger else None)
-        # ---------------------------------------------
-        # ECM (Emotional Context Module) initialization 
-        # ---------------------------------------------
+
         if (
             self.doc_store is None
             and document_store_mod
@@ -252,6 +256,7 @@ class App(tk.Tk):
                 print("Warning: CommandProcessor failed to init:", e)
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_index()
 
     # ---------- UI ----------
@@ -268,7 +273,7 @@ class App(tk.Tk):
             label="Export to Intraweb (Flask)…", command=self._export_and_launch_flask
         )
         filemenu.add_separator()
-        filemenu.add_command(label="Quit", command=self.destroy)
+        filemenu.add_command(label="Quit", command=self._on_close)
         menubar.add_cascade(label="File", menu=filemenu)
 
         opmlmenu = tk.Menu(menubar, tearoff=0)
@@ -312,6 +317,9 @@ class App(tk.Tk):
             side="left", padx=4, pady=4
         )
         ttk.Button(bar, text="Reparse Links", command=self._reparse_links).pack(
+            side="left", padx=4, pady=4
+        )
+        ttk.Button(bar, text="ECM", command=self._on_ecm).pack(
             side="left", padx=4, pady=4
         )
         ttk.Button(bar, text="Flask", command=self._export_and_launch_flask).pack(
@@ -365,6 +373,7 @@ class App(tk.Tk):
 
         # Context menu on text
         self.text.bind("<Button-3>", self._show_context_menu)
+        self.text.bind("<KeyPress>", self._on_text_keypress, add="+")
 
         # OPML Tree mode widgets
         self.tree_frame = ttk.Frame(self.right_stack)
@@ -408,6 +417,21 @@ class App(tk.Tk):
             self.context_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.context_menu.grab_release()
+
+    def _on_text_keypress(self, event):
+        if self.processor and hasattr(self.processor, "ingest_tk_keypress"):
+            try:
+                self.processor.ingest_tk_keypress(event)
+            except Exception:
+                pass
+
+    def _on_close(self):
+        if self.processor and hasattr(self.processor, "shutdown"):
+            try:
+                self.processor.shutdown()
+            except Exception:
+                pass
+        self.destroy()
 
     # ---------- Mode switching ----------
     def _show_text_mode(self):
@@ -749,7 +773,6 @@ class App(tk.Tk):
                 print("render_binary_as_text failed:", e)
 
     # ---------- Commands ----------
-    # ---------- Commands ----------
 
     def _on_ask(self):
         sel = self._get_selected_text()
@@ -1059,6 +1082,31 @@ class App(tk.Tk):
                     "end",
                     values=(doc_id, _make_preview(title, content), _human_size(size)),
                 )
+
+    def _on_ecm(self):
+        """Open ECM controls if available, otherwise fall back to a read-only view."""
+        if open_ecm_settings_dialog:
+            open_ecm_settings_dialog(self)
+            return
+        if not self.processor or not hasattr(self.processor, "ecm_bridge"):
+            messagebox.showinfo("ECM", "ECM Bridge not available in processor.")
+            return
+
+        import json
+        info = {
+            "preamp": self.processor.ecm_bridge.get_debug_info(),
+            "ecm2": self.processor.get_ecm_snapshot()
+            if hasattr(self.processor, "get_ecm_snapshot")
+            else {},
+        }
+        msg = json.dumps(info, indent=2)
+
+        win = tk.Toplevel(self)
+        win.title("ECM Status")
+        txt = tk.Text(win, wrap="none", font=("Courier", 10))
+        txt.pack(fill="both", expand=True)
+        txt.insert("1.0", msg)
+        txt.config(state="disabled")
 
     def _save_visible_text(self):
         if self._mode != "text":

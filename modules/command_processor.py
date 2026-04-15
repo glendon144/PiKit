@@ -11,182 +11,282 @@ from modules.document_store import DocumentStore
 from modules.directory_import import import_text_files_from_directory
 from modules.ai_memory import get_memory, set_memory
 from modules.text_sanitizer import sanitize_ai_reply
+from modules.ecm_bridge import ECMBridge
 
 # ------------ Config (env-tunable) ------------
 SHORT_THRESHOLD_TOKENS = int(os.getenv("PIKIT_SHORT_THRESHOLD_TOKENS", "200"))
-SHORT_MAX_TOKENS       = int(os.getenv("PIKIT_SHORT_MAX_TOKENS", "220"))   # quick replies
-LONG_MAX_TOKENS        = int(os.getenv("PIKIT_LONG_MAX_TOKENS", "900"))    # detailed replies
+SHORT_MAX_TOKENS = int(os.getenv("PIKIT_SHORT_MAX_TOKENS", "220"))  # quick replies
+LONG_MAX_TOKENS = int(os.getenv("PIKIT_LONG_MAX_TOKENS", "900"))    # detailed replies
 # If you simply want to "double tokens", bump LONG_MAX_TOKENS and/or SHORT_MAX_TOKENS above.
 # Timeout was already made env-configurable in ai_interface/local_ai_interface earlier.
 
-# Try to import a renderer for binary-as-text; provide a fallback shim if unavailable.
-try:
-    from modules.renderer import render_binary_as_text  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        from modules.hypertext_parser import render_binary_as_text  # type: ignore
-    except Exception:  # pragma: no cover
-        def render_binary_as_text(data_or_path: Any, title: str = "Document") -> str:
-            try:
-                if isinstance(data_or_path, (bytes, bytearray)):
-                    return data_or_path.decode("utf-8", errors="replace")
-                if isinstance(data_or_path, str) and os.path.exists(data_or_path):
-                    with open(data_or_path, "rb") as f:
-                        raw = f.read()
-                    return raw.decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            return str(data_or_path)
-
-
-def _approx_tokens(text: str) -> int:
-    """Very rough token estimate (~4 chars/token for English)."""
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
-
-
-def _normalize_row(row: Any) -> Tuple[Any, str, Any]:
-    """Normalize a document row to (id, title, body).
-    Supports sqlite3.Row (mapping-like), dict, and sequence (tuple/list).
-    """
-    # sqlite3.Row behaves like a mapping and supports .keys() and index by column name
-    try:
-        if hasattr(row, "keys"):
-            keys = set(row.keys())
-            did = row["id"] if "id" in keys else None
-            title = row["title"] if "title" in keys else "Document"
-            body = row["body"] if "body" in keys else ""
-            return did, (title or "Document"), body
-    except Exception:
-        pass
-
-    # Dict path
-    if isinstance(row, dict):
-        return row.get("id"), (row.get("title") or "Document"), row.get("body")
-
-    # Sequence path (tuple/list/sqlite3.Row via index access)
-    try:
-        if not isinstance(row, (str, bytes, bytearray)) and hasattr(row, "__getitem__"):
-            did = row[0] if len(row) > 0 else None
-            title = row[1] if len(row) > 1 else "Document"
-            body = row[2] if len(row) > 2 else ""
-            return did, (title or "Document"), body
-    except Exception:
-        pass
-
-    # Fallback: treat entire row as body
-    return None, "Document", row
-
 
 class CommandProcessor:
-    def __init__(self, store: DocumentStore, ai_interface, logger: Logger | None = None):
-        self.doc_store = store
-        self.ai = ai_interface
-        self.logger = logger if logger else Logger()
+    def __init__(
+        self,
+        store: DocumentStore | None = None,
+        ai_interface=None,
+        logger: Logger | None = None,
+    ):
+        """
+        CommandProcessor wiring:
+        - store: DocumentStore instance (optional; default = new DocumentStore())
+        - ai_interface: object with .query(prompt, **kwargs) (optional; best-effort default)
+        - logger: Logger instance (optional; default = new Logger())
+        """
+        self.doc_store = store if store is not None else DocumentStore()
+        self.ai = ai_interface if ai_interface is not None else self._init_default_ai()
+        self.logger = logger if logger is not None else Logger()
+        self.ecm_bridge = ECMBridge()
+        self.ecm_engine = self._init_ecm_engine()
 
-    # --------------- Memory helpers ---------------
+    def _init_default_ai(self):
+        """
+        Best-effort default AI interface loader.
+        This keeps older PiKit setups working without requiring explicit wiring.
+        """
+        try:
+            from modules import ai_interface as ai_mod  # type: ignore[attr-defined]
 
-    def _get_conn(self):
-        """Return the SQLite connection from the document store, if available."""
-        return getattr(self.doc_store, "conn", None)
+            # Common patterns we've used in past builds:
+            if hasattr(ai_mod, "get_ai"):
+                return ai_mod.get_ai()
+            if hasattr(ai_mod, "AIInterface"):
+                return ai_mod.AIInterface()
+            # Fallback: treat module itself as the interface if it has .query
+            if hasattr(ai_mod, "query"):
+                return ai_mod
+            raise RuntimeError("modules.ai_interface has no usable entrypoint")
+        except Exception as e:
+            # Fail loud so the user sees a clear error instead of silent no-op AI
+            raise RuntimeError(
+                "No ai_interface provided and automatic AI init failed."
+            ) from e
 
-    def _build_memory_preamble(self, mem: dict, current_doc_id: int | None = None) -> str:
-        """Construct a small instruction block from memory to steer the model."""
-        if not isinstance(mem, dict):
-            return ""
-        persona = mem.get("persona")
-        style = mem.get("style")
-        rules = mem.get("rules", [])
-        parts: list[str] = []
-        if persona:
-            parts.append(f"Persona: {persona}")
-        if style:
-            parts.append(f"Style: {style}")
-        if rules:
-            parts.append("Rules: " + "; ".join(rules))
-        return "\n".join(parts).strip()
+    def _init_ecm_engine(self):
+        """
+        Best-effort ECM2 loader.
+        If optional deps are missing, PiKit still works with the text preamp.
+        """
+        try:
+            from modules.ecm2 import ECMEngine
 
-    def _update_memory_breadcrumbs(self, prompt: str) -> None:
-        """Record last-used time and a short rolling log of prompts."""
-        conn = self._get_conn()
-        if not conn:
+            storage_dir = Path(__file__).resolve().parent.parent / "storage"
+            storage_dir.mkdir(parents=True, exist_ok=True)
+            engine = ECMEngine(db_path=str(storage_dir / "ecm_labels.db"))
+            engine.start()
+            return engine
+        except Exception as e:
+            self.logger.info(f"ECM2 unavailable; continuing with preamp only: {e}")
+            return None
+
+    def shutdown(self) -> None:
+        engine = getattr(self, "ecm_engine", None)
+        if not engine:
             return
         try:
-            mem = get_memory(conn, key="global")
-            if not isinstance(mem, dict):
-                mem = {}
-            mem.setdefault("recent_prompts", [])
-            mem["recent_prompts"] = (mem["recent_prompts"] + [prompt])[-20:]
-            mem["last_used"] = int(time.time())
-            set_memory(conn, mem, key="global")
+            engine.stop()
         except Exception as e:
-            # Non-fatal; keep the AI flow working even if memory write fails
-            self.logger.info(f"Non-fatal: failed to update ai_memory: {e}")
+            self.logger.info(f"Non-fatal: failed to stop ECM2 engine: {e}")
 
-    # --------------- Public API ---------------
+    def _event_to_key_id(self, event) -> tuple[str | None, bool]:
+        keysym = getattr(event, "keysym", "") or ""
+        char = getattr(event, "char", "") or ""
 
-    def set_api_key(self, api_key: str) -> None:
+        if keysym == "BackSpace":
+            return "<BS>", True
+        if keysym in {"Return", "KP_Enter"}:
+            return "<ENT>", False
+        if keysym == "space":
+            return "<SP>", False
+        if keysym == "Tab":
+            return "<TAB>", False
+        if keysym in {"Shift_L", "Shift_R"}:
+            return "<SHIFT>", False
+        if keysym in {"Control_L", "Control_R"}:
+            return "<CTRL>", False
+        if keysym in {"Alt_L", "Alt_R"}:
+            return "<ALT>", False
+        if char:
+            if char.isalpha():
+                return "<A>", False
+            if char.isdigit():
+                return "<D>", False
+            if char.isspace():
+                return "<SP>", False
+            return "<P>", False
+        return None, False
+
+    def ingest_tk_keypress(self, event) -> None:
+        engine = getattr(self, "ecm_engine", None)
+        if not engine:
+            return
+        key_id, is_backspace = self._event_to_key_id(event)
+        if not key_id:
+            return
         try:
-            self.ai.set_api_key(api_key)
-            self.logger.info("API key successfully set in AI interface")
+            engine.add_key_event(ts=time.time(), key_id=key_id, is_backspace=is_backspace)
         except Exception as e:
-            self.logger.error(f"Failed to set API key: {e}")
+            self.logger.info(f"Non-fatal: failed to capture ECM2 key event: {e}")
 
-    def get_context_menu_actions(self) -> dict:
-        return {
-            "Import CSV": self.doc_store.import_csv,
-            "Export CSV": self.doc_store.export_csv,
-        }
-
-    # ----------------- Core prompting -----------------
-
-    def _choose_length_policy(self, prompt_text: str) -> tuple[int, str]:
-        """Return (max_tokens, steering_instructions) based on input size."""
-        n = _approx_tokens(prompt_text)
-        if n < SHORT_THRESHOLD_TOKENS:
-            steer = "Output: be thorough and eloquent"
-            return SHORT_MAX_TOKENS, steer
-        else:
-            steer = "Output: thorough and structured; use short sections and examples where useful."
-            return LONG_MAX_TOKENS, steer
-
-    def _apply_overrides(self, prompt: str, max_tokens: int):
-        """Try to send max_tokens to the AI interface if supported; otherwise return prompt only."""
-        # Many of your local interfaces accept overrides= dict
+    def get_ecm_snapshot(self) -> dict[str, Any]:
+        engine = getattr(self, "ecm_engine", None)
+        if not engine:
+            return {}
         try:
-            return {"overrides": {"max_tokens": max_tokens}}
+            return engine.now().model_dump()
         except Exception:
             return {}
 
-    def ask_question(self, prompt: str) -> str | None:
-        """Send a standalone prompt to AI, applying memory preamble, adaptive length, and truncation."""
+    def _build_ecm2_preamble(self, snapshot: dict[str, Any]) -> str:
+        if not snapshot:
+            return ""
+
+        mode = snapshot.get("tempo_mode", "normal")
+        valence = float(snapshot.get("valence", 0.0) or 0.0)
+        confidence = float(snapshot.get("confidence", 0.0) or 0.0)
+        tokens_per_minute = int(snapshot.get("tokens_per_minute", 0) or 0)
+
+        lines = ["[ECM2 Temporal Signals]"]
+        lines.append(
+            f"- tempo_mode={mode}; valence={valence:.2f}; confidence={confidence:.2f}; advisory_tpm={tokens_per_minute}"
+        )
+
+        if mode == "rest":
+            lines.append("- Keep the reply compact, calm, and low-pressure.")
+        elif mode == "slow":
+            lines.append("- Use measured pacing and shorter paragraphs.")
+        else:
+            lines.append("- Normal pacing is fine; stay responsive and clear.")
+
+        if valence < -0.25:
+            lines.append("- Favor grounding and clarity over exuberance.")
+        elif valence > 0.35:
+            lines.append("- A lightly upbeat tone is acceptable, but avoid hype.")
+
+        return "\n".join(lines)
+
+    # -------------------------------------
+    # Helper: memory prefix (legacy, still usable elsewhere)
+    # -------------------------------------
+    def build_memory_prefix(self) -> str:
+        """
+        Build a short "context preamble" from PiKit's AI memory.
+        """
+        conn = self._get_conn()
+        if not conn:
+            return ""
+
         try:
-            conn = self._get_conn()
-            mem = get_memory(conn, key="global") if conn else {}
-            preamble = self._build_memory_preamble(mem)
-
-            # Adaptive length
-            max_toks, steer = self._choose_length_policy(prompt)
-            full_prompt_core = (preamble + "\n\n" + prompt) if preamble else prompt
-            full_prompt = f"{full_prompt_core}\n\n{steer}"
-
-            self.logger.info(f"Sending standalone prompt to AI (max_tokens={max_toks}): {full_prompt}")
-            kwargs = self._apply_overrides(full_prompt, max_toks)
-            try:
-                response = self.ai.query(full_prompt, **kwargs)
-            except TypeError:
-                # Fallback if interface doesn't accept overrides kwarg
-                response = self.ai.query(full_prompt)
-
-            response = sanitize_ai_reply(response)
-            self.logger.info("AI response received successfully")
-            self._update_memory_breadcrumbs(prompt)
-            return response
+            mem = get_memory(conn, key="global")
         except Exception as e:
-            self.logger.error(f"AI query failed: {e}")
-            return None
+            self.logger.error(f"build_memory_prefix: failed to load memory: {e}")
+            return ""
 
+        if not mem:
+            return ""
+
+        # Very small, human-readable preamble
+        lines = ["[PiKit Memory Snapshot]"]
+        notes = mem.get("notes") or []
+        for note in notes[-5:]:
+            lines.append(f"- {note}")
+        return "\n".join(lines)
+
+    def _get_conn(self):
+        """
+        If DocumentStore has a connection getter, use it.
+        Otherwise return None (memory preamble becomes empty).
+        """
+        if hasattr(self.doc_store, "get_connection"):
+            try:
+                return self.doc_store.get_connection()
+            except Exception as e:
+                self.logger.error(f"_get_conn failed: {e}")
+        return None
+
+    # -------------------------------------
+    # Helper: pick length policy from prompt
+    # -------------------------------------
+    def _choose_length_policy(self, prompt: str) -> Tuple[int | None, str]:
+        """
+        Inspect the user's prefix/instruction to decide how long the answer should be.
+
+        Returns:
+            (max_tokens, steering_suffix)
+        """
+        text = prompt.lower()
+
+        # Explicit user overrides first
+        if "bullet points" in text or "bullet-point" in text:
+            return SHORT_MAX_TOKENS, "Please answer in concise bullet points."
+        if "short answer" in text or "keep it brief" in text or "short version" in text:
+            return SHORT_MAX_TOKENS, "Please keep the answer brief but complete."
+        if "long answer" in text or "go into detail" in text or "deep dive" in text:
+            return LONG_MAX_TOKENS, "You may answer in more detail, but keep it coherent."
+
+        # Heuristic based on length of prefix
+        approx_prompt_tokens = max(1, len(prompt) // 4)  # crude char→token guess
+
+        if approx_prompt_tokens < SHORT_THRESHOLD_TOKENS // 4:
+            # Very small selection / prefix → short answer
+            return SHORT_MAX_TOKENS, "Please answer succinctly, focusing on the key idea."
+        elif approx_prompt_tokens < SHORT_THRESHOLD_TOKENS:
+            # Medium → medium-ish but within short budget
+            return SHORT_MAX_TOKENS, (
+                "Please answer clearly but do not exceed a moderate length."
+            )
+        else:
+            # Large prompt → we assume user can handle more detail
+            return LONG_MAX_TOKENS, (
+                "Please provide a detailed but well-structured answer. "
+                "Avoid digressions and stay on-topic."
+            )
+
+    # -------------------------------------
+    # Helper: apply per-call overrides
+    # -------------------------------------
+    def _apply_overrides(self, prompt: str, max_tokens: int | None) -> dict:
+        """
+        Prepare kwargs for self.ai.query, including token limit.
+        """
+        kwargs: dict[str, Any] = {}
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        return kwargs
+
+    # -------------------------------------
+    # Helper: update memory breadcrumbs
+    # -------------------------------------
+    def _update_memory_breadcrumbs(self, text: str) -> None:
+        """
+        Append a short breadcrumb about what we just asked.
+        """
+        conn = self._get_conn()
+        if not conn:
+            return
+
+        try:
+            mem = get_memory(conn, key="global") or {}
+        except Exception:
+            mem = {}
+
+        notes = mem.get("notes") or []
+        snippet = text.strip().replace("\n", " ")
+        if len(snippet) > 120:
+            snippet = snippet[:117] + "..."
+        notes.append(f"ASK: {snippet}")
+        mem["notes"] = notes[-100:]  # keep last 100
+        try:
+            import json
+            set_memory(conn, mem, key="global")
+
+        except Exception as e:
+            self.logger.error(f"_update_memory_breadcrumbs failed: {e}")
+
+    # -------------------------------------
+    # Core AI call (CAP-aware + ECM-capable)
+    # -------------------------------------
     def query_ai(
         self,
         selected_text: str,
@@ -196,242 +296,195 @@ class CommandProcessor:
         prefix: str | None = None,
         sel_start: int | None = None,
         sel_end: int | None = None,
-    ) -> None:
+        full_prompt: str | None = None,  # optional ECM-supplied full prompt
+    ) -> str:
         """
-        Send the selection to AI, create a new doc with the response, and optionally embed
-        a green link back into the source doc (text bodies only). Also applies memory preamble,
-        adaptive length, and truncates likely-incomplete sentences.
+        Send the selection (or full_prompt) to AI, create a new doc with the response,
+        and update the original doc by embedding a green-link-style reference.
+
+        Returns:
+            The raw AI reply string (or "" on failure).
         """
-        # Compose the base prompt
-        base_prompt = f"{prefix} {selected_text}" if prefix else f"Please expand on this: {selected_text}"
 
-        # Memory preamble
-        conn = self._get_conn()
-        mem = get_memory(conn, key="global") if conn else {}
-        preamble = self._build_memory_preamble(mem, current_doc_id=current_doc_id)
-        prompt_core = (preamble + "\n\n" + base_prompt) if preamble else base_prompt
+        # Ensure prefix always exists
+        if prefix is None:
+            prefix = ""
 
-        # Adaptive length
-        max_toks, steer = self._choose_length_policy(base_prompt)
-        prompt = f"{prompt_core}\n\n{steer}"
+        # If the GUI / ECM client has provided a full_prompt (already containing
+        # memory, ECM metrics, etc.), we trust it and skip preamble rebuild.
+        if full_prompt is not None:
+            prompt = full_prompt
+            base_prompt = prefix + " " + selected_text if prefix else selected_text
+            max_toks = None
+            self.logger.info("Received external full_prompt (ECM-enabled caller).")
+        else:
+            # --- ECM Adaptive Prefix ---
+            ecm_prefix = self.ecm_bridge.process_user_input(selected_text)
+            ecm2_snapshot = self.get_ecm_snapshot()
+            ecm2_preamble = self._build_ecm2_preamble(ecm2_snapshot)
+            
+            # Build base instruction from prefix + selected text
+            base_prompt = (
+                f"{prefix} {selected_text}"
+                if prefix
+                else f"Please expand on this: {selected_text}"
+            )
 
-        self.logger.info(f"Sending prompt: max_tokens={max_toks} | {prompt}")
+            # Memory preamble
+            conn = self._get_conn()
+            mem = get_memory(conn, key="global") if conn else {}
+            preamble = self._build_memory_preamble(mem, current_doc_id=current_doc_id)
+            sections = [part for part in (preamble, ecm2_preamble, ecm_prefix, base_prompt) if part]
+            prompt_core = "\n\n".join(sections)
 
-        # Call AI
+            # Token budget + steering
+            max_toks, steer = self._choose_length_policy(base_prompt)
+            prompt = f"{prompt_core}\n\n{steer}"
+
+        # ---- AI CALL ----
         try:
             kwargs = self._apply_overrides(prompt, max_toks)
+            self.logger.info(
+                f"Sending AI prompt (max_tokens={kwargs.get('max_tokens')}): "
+                f"{prompt[:200]}..."
+            )
             try:
-                reply = self.ai.query(prompt, **kwargs)
+                response = self.ai.query(prompt, **kwargs)
             except TypeError:
-                reply = self.ai.query(prompt)
-            reply = sanitize_ai_reply(reply)
+                # Fallback if local AI wrapper doesn't accept kwargs
+                response = self.ai.query(prompt)
+            
+            # Filter response through ECM
+            filtered_response = self.ecm_bridge.filter_response(response)
+            reply = sanitize_ai_reply(filtered_response)
         except Exception as e:
             self.logger.error(f"AI query failed: {e}")
-            return
+            return ""
 
-        self.logger.info("AI query successful")
-
-        # Create the AI response document
+        # ---- Create new doc ----
         new_doc_id = self.doc_store.add_document("AI Response", reply)
         self.logger.info(f"Created new document {new_doc_id}")
 
-        # Try to embed a green link in the original text document
+        # ---- Update original doc with a green-link-style reference ----
+        link_offset = -1  # where we inserted the link, if applicable
+
         try:
             original = self.doc_store.get_document(current_doc_id)
-        except Exception as e:
+        except Exception:
             original = None
-            self.logger.error(f"Failed to load original doc {current_doc_id}: {e}")
 
         if original is not None:
             try:
-                _, _title, body = _normalize_row(original)
+                _id, title, body = original
             except Exception:
                 body = ""
 
             if isinstance(body, str) and selected_text:
-                link_md = f"[{selected_text}](doc:{new_doc_id})"
-                updated: str | None = None
-
-                # If explicit offsets are provided and valid, use them
-                if (
-                    isinstance(sel_start, int)
-                    and isinstance(sel_end, int)
-                    and 0 <= sel_start < sel_end <= len(body)
-                ):
-                    updated = body[:sel_start] + link_md + body[sel_end:]
-                    self.logger.info(f"Embedded link at offsets {sel_start}-{sel_end}")
-                else:
-                    # Fallback: first occurrence replacement
-                    if selected_text in body:
-                        updated = body.replace(selected_text, link_md, 1)
-                        self.logger.info("Embedded link by substring replace")
+                try:
+                    # Simple, robust "green link" text:
+                    # replace first occurrence of the selection with a linked version.
+                    link_text = f"[{selected_text}](doc:{new_doc_id})"
+                    idx = body.find(selected_text)
+                    if idx != -1:
+                        updated = (
+                            body[:idx]
+                            + link_text
+                            + body[idx + len(selected_text) :]
+                        )
+                        link_offset = idx
                     else:
-                        self.logger.info("Selected text not found; original unchanged")
+                        # Selection not found; append a reference at the end.
+                        updated = body + f"\n\n[Link to AI response ({new_doc_id})]"
+                        link_offset = len(body)
 
-                if updated is not None and updated != body:
-                    try:
-                        if hasattr(self.doc_store, "update_document_body"):
-                            self.doc_store.update_document_body(current_doc_id, updated)
-                        else:
-                            # Some stores expose a generic update_document(id, body)
-                            self.doc_store.update_document(current_doc_id, updated)  # type: ignore
-                    except Exception as e:
-                        self.logger.error(f"Failed updating original doc {current_doc_id}: {e}")
-            else:
-                # Skip binary or missing bodies
-                if isinstance(body, (bytes, bytearray)):
-                    self.logger.info("Original doc is binary; skipping in-place link embed.")
-        else:
-            self.logger.error(f"Original document {current_doc_id} not found")
+                    if hasattr(self.doc_store, "update_document_body"):
+                        self.doc_store.update_document_body(current_doc_id, updated)
+                    else:
+                        # Legacy signature: update_document(id, new_body)
+                        self.doc_store.update_document(current_doc_id, updated)
 
-        # Update memory breadcrumbs (non-fatal on error)
+                    self.logger.info(
+                        f"Embedded green-link reference into doc {current_doc_id}"
+                    )
+                except Exception as e:
+                    self.logger.error(
+                        f"Failed updating original doc {current_doc_id}: {e}"
+                    )
+
+        # Memory breadcrumbs (non-critical)
         try:
             self._update_memory_breadcrumbs(base_prompt)
         except Exception:
             pass
 
-        # Fire UI callbacks
+        # Fire callbacks
         try:
-            on_link_created(selected_text)
+            # To preserve compatibility with existing GUIs, we only use the
+            # simple signature by default: on_link_created(new_doc_id).
+            # The offset-aware form can be enabled later if needed.
+            try:
+                on_link_created(new_doc_id)
+            except TypeError:
+                # Older signature: on_link_created(text)
+                on_link_created(selected_text)
         except Exception as e:
             self.logger.info(f"on_link_created callback failed (non-fatal): {e}")
+
         try:
             on_success(new_doc_id)
         except Exception as e:
             self.logger.info(f"on_success callback failed (non-fatal): {e}")
 
-    # --------------- External file operations ---------------
+        return reply
+
+    # -------------------------------------
+    # File import/export
+    # -------------------------------------
 
     def import_document_from_path(self, path: str) -> int:
-        """Import a file from *path* and return new document ID."""
+        """
+        Import a single text file as a new document.
+        """
         p = Path(path)
-        title = p.stem
-        try:
-            text = p.read_text(encoding="utf-8")
-            return self.doc_store.add_document(title, text)
-        except UnicodeDecodeError:
-            data = p.read_bytes()  # store as SQLite BLOB
-            return self.doc_store.add_document(title, data)
+        if not p.exists():
+            raise FileNotFoundError(path)
+        text = p.read_text(encoding="utf-8", errors="replace")
+        title = p.name
+        return self.doc_store.add_document(title, text)
 
-    def export_document_to_path(self, doc_id: int, path: str) -> None:
-        """Export document *doc_id* to filesystem path."""
-        row = self.doc_store.get_document(doc_id)
+    def import_directory(self, dir_path: str) -> int:
+        """
+        Import all text files from a directory using directory_import helper.
+        """
+        directory = Path(dir_path)
+        if not directory.is_dir():
+            raise NotADirectoryError(dir_path)
 
-        if hasattr(row, "keys"):  # sqlite3.Row with mapping behavior
-            body = row["body"] if row else ""
-        elif isinstance(row, dict):
-            body = row.get("body")
-        else:
-            body = row[2] if row and len(row) > 2 else ""
-
-        p = Path(path)
-        if isinstance(body, (bytes, bytearray)):
-            p.write_bytes(bytes(body))
-        else:
-            p.write_text("" if body is None else str(body), encoding="utf-8")
-
-    # --------------- Render helpers ---------------
-
-    def get_strings_content(self, doc_id: int) -> str:
-        """Return a text rendering of the document suitable for display/export."""
-        try:
-            row = self.doc_store.get_document(doc_id)
-        except Exception:
-            row = None
-
-        if not row:
-            return "[ERROR] Document not found."
-
-        _id, title, body = _normalize_row(row)
-
-        # If body looks like a filesystem path and exists, prefer that
-        if isinstance(body, str) and os.path.exists(body):
+        count = 0
+        for file_path in import_text_files_from_directory(directory):
             try:
-                return render_binary_as_text(body, title)
-            except Exception:
-                pass
+                self.import_document_from_path(str(file_path))
+                count += 1
+            except Exception as e:
+                self.logger.error(f"Failed importing {file_path}: {e}")
+        return count
 
-        # If it's bytes/bytearray, convert via renderer
-        if isinstance(body, (bytes, bytearray)):
-            return render_binary_as_text(body, title)
-
-        # Else, return text as-is
-        return str(body or "")
-
-    # --------------- Bulk imports ---------------
-
-    def import_opml_from_path(self, path: str) -> int:
-        """Import an OPML/XML file from *path* and return new document ID."""
-        content = Path(path).read_text(encoding="utf-8", errors="replace")
-        title = Path(path).stem
-        return self.doc_store.add_document(title, content)
-     # --- OPML: helpers for string / URL / crawler -------------------------------
-import os
-import tempfile
-
-def import_opml_from_string(self, xml_text: str, source: str = "") -> int:
-    """
-    Import an OPML document provided as a string.
-    Bridges to import_opml_from_path by writing to a temp file.
-    Returns: new document id.
-    """
-    # choose a safe temp dir under storage if available
-    base_tmp = getattr(self, "storage_dir", None)
-    if not base_tmp:
-        base_tmp = os.path.join(os.getcwd(), "storage")
-    os.makedirs(base_tmp, exist_ok=True)
-
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix="opml_", suffix=".opml",
-                                     dir=base_tmp, delete=False) as tf:
-        tf.write(xml_text)
-        tmp_path = tf.name
-
-    # Optionally you could record 'source' somewhere if your importer supports it
-    try:
-        new_id = self.import_opml_from_path(tmp_path)
-        return new_id
-    finally:
-        # Keep the temp file if your importer needs it later; otherwise uncomment:
-        # try: os.remove(tmp_path)
-        # except Exception: pass
-        pass
-
-
-def import_opml_from_url(self, url: str, timeout: int = 15) -> int:
-    """
-    Fetch an OPML from URL and import it.
-    """
-    try:
-        import requests
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "PiKit/OPML-Importer"})
-        r.raise_for_status()
-        xml_text = r.text
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch OPML from URL: {e}")
-    return self.import_opml_from_string(xml_text, source=url)
-
-
-def crawl_opml_and_import(self, start: str, max_depth: int = 2) -> list[int]:
-    """
-    Crawl an OPML seed (URL or local path), gather linked OPMLs, and import each.
-    Returns the list of new document IDs.
-    """
-    try:
-        from modules.opml_crawler_adapter import crawl_opml
-    except Exception as e:
-        raise RuntimeError(f"OPML crawler not available: {e}")
-
-    results = crawl_opml(start, max_depth=max_depth)
-    new_ids: list[int] = []
-    for src, xml_text in results:
-        try:
-            new_id = self.import_opml_from_string(xml_text, source=src)
-            new_ids.append(new_id)
-        except Exception as e:
-            print(f"[opml] import failed for {src}: {e}")
-    return new_ids
- 
-
-    def import_directory(self, directory: str) -> None:
-        """Bulk-import text files from a directory."""
-        import_text_files_from_directory(self.doc_store, directory)
+    # -------------------------------------
+    # Memory preamble builder (inner)
+    # -------------------------------------
+    def _build_memory_preamble(self, mem: dict, current_doc_id: int | None) -> str:
+        """
+        Convert the AI memory dict plus current_doc_id into a compact text preamble.
+        """
+        if not mem:
+            return ""
+        lines = []
+        lines.append("[PiKit Memory]")
+        if current_doc_id is not None:
+            lines.append(f"- You are currently working in document #{current_doc_id}.")
+        notes = mem.get("notes") or []
+        if notes:
+            lines.append("- Recent notes:")
+            for note in notes[-5:]:
+                lines.append(f"  * {note}")
+        return "\n".join(lines)
