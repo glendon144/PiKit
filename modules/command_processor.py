@@ -14,6 +14,7 @@ from modules.document_store import DocumentStore
 from modules.document_transfer import DEFAULT_FLASK_PORT
 from modules.directory_import import import_text_files_from_directory
 from modules.ai_memory import get_memory, set_memory
+from modules.ecm_bridge import ECMBridge
 from modules.text_sanitizer import sanitize_ai_reply
 
 # ------------ Config (env-tunable) ------------
@@ -89,6 +90,8 @@ class CommandProcessor:
         self.ai = ai_interface
         self.logger = logger if logger else Logger()
         self.dream_handler: Callable[..., None] | None = None
+        self.ecm_bridge = ECMBridge()
+        self.ecm_engine = self._init_ecm_engine()
 
     def set_dream_handler(self, handler: Callable[..., None] | None) -> None:
         """Register a callback for lightweight Dream-mode event logging."""
@@ -106,6 +109,106 @@ class CommandProcessor:
                 self.logger.info(f"Dream handler failed (non-fatal): {e}")
         except Exception as e:
             self.logger.info(f"Dream handler failed (non-fatal): {e}")
+
+    def _init_ecm_engine(self):
+        """Best-effort ECM2 loader; text preamp still works if this fails."""
+        try:
+            from modules.ecm2 import ECMEngine
+
+            storage_dir = Path(__file__).resolve().parent.parent / "storage"
+            storage_dir.mkdir(parents=True, exist_ok=True)
+            engine = ECMEngine(db_path=str(storage_dir / "ecm_labels.db"))
+            engine.start()
+            return engine
+        except Exception as e:
+            self.logger.info(f"ECM2 unavailable; continuing with preamp only: {e}")
+            return None
+
+    def shutdown(self) -> None:
+        engine = getattr(self, "ecm_engine", None)
+        if not engine:
+            return
+        try:
+            engine.stop()
+        except Exception as e:
+            self.logger.info(f"Non-fatal: failed to stop ECM2 engine: {e}")
+
+    def _event_to_key_id(self, event) -> tuple[str | None, bool]:
+        keysym = getattr(event, "keysym", "") or ""
+        char = getattr(event, "char", "") or ""
+
+        if keysym == "BackSpace":
+            return "<BS>", True
+        if keysym in {"Return", "KP_Enter"}:
+            return "<ENT>", False
+        if keysym == "space":
+            return "<SP>", False
+        if keysym == "Tab":
+            return "<TAB>", False
+        if keysym in {"Shift_L", "Shift_R"}:
+            return "<SHIFT>", False
+        if keysym in {"Control_L", "Control_R"}:
+            return "<CTRL>", False
+        if keysym in {"Alt_L", "Alt_R"}:
+            return "<ALT>", False
+        if char:
+            if char.isalpha():
+                return "<A>", False
+            if char.isdigit():
+                return "<D>", False
+            if char.isspace():
+                return "<SP>", False
+            return "<P>", False
+        return None, False
+
+    def ingest_tk_keypress(self, event) -> None:
+        engine = getattr(self, "ecm_engine", None)
+        if not engine:
+            return
+        key_id, is_backspace = self._event_to_key_id(event)
+        if not key_id:
+            return
+        try:
+            engine.add_key_event(ts=time.time(), key_id=key_id, is_backspace=is_backspace)
+        except Exception as e:
+            self.logger.info(f"Non-fatal: failed to capture ECM2 key event: {e}")
+
+    def get_ecm_snapshot(self) -> dict[str, Any]:
+        engine = getattr(self, "ecm_engine", None)
+        if not engine:
+            return {}
+        try:
+            return engine.now().model_dump()
+        except Exception:
+            return {}
+
+    def _build_ecm2_preamble(self, snapshot: dict[str, Any]) -> str:
+        if not snapshot:
+            return ""
+
+        mode = snapshot.get("tempo_mode", "normal")
+        valence = float(snapshot.get("valence", 0.0) or 0.0)
+        confidence = float(snapshot.get("confidence", 0.0) or 0.0)
+        tokens_per_minute = int(snapshot.get("tokens_per_minute", 0) or 0)
+
+        lines = ["[ECM2 Temporal Signals]"]
+        lines.append(
+            f"- tempo_mode={mode}; valence={valence:.2f}; confidence={confidence:.2f}; advisory_tpm={tokens_per_minute}"
+        )
+
+        if mode == "rest":
+            lines.append("- Keep the reply compact, calm, and low-pressure.")
+        elif mode == "slow":
+            lines.append("- Use measured pacing and shorter paragraphs.")
+        else:
+            lines.append("- Normal pacing is fine; stay responsive and clear.")
+
+        if valence < -0.25:
+            lines.append("- Favor grounding and clarity over exuberance.")
+        elif valence > 0.35:
+            lines.append("- A lightly upbeat tone is acceptable, but avoid hype.")
+
+        return "\n".join(lines)
 
     # --------------- Memory helpers ---------------
 
@@ -314,11 +417,16 @@ class CommandProcessor:
         # Compose the base prompt
         base_prompt = f"{prefix} {selected_text}" if prefix else f"Please expand on this: {selected_text}"
 
+        ecm_prefix = self.ecm_bridge.process_user_input(selected_text)
+        ecm2_snapshot = self.get_ecm_snapshot()
+        ecm2_preamble = self._build_ecm2_preamble(ecm2_snapshot)
+
         # Memory preamble
         conn = self._get_conn()
         mem = get_memory(conn, key="global") if conn else {}
         preamble = self._build_memory_preamble(mem, current_doc_id=current_doc_id)
-        prompt_core = (preamble + "\n\n" + base_prompt) if preamble else base_prompt
+        sections = [part for part in (preamble, ecm2_preamble, ecm_prefix, base_prompt) if part]
+        prompt_core = "\n\n".join(sections)
 
         # Adaptive length
         max_toks, steer = self._choose_length_policy(base_prompt)
@@ -339,7 +447,7 @@ class CommandProcessor:
                 reply = self.ai.query(prompt, **kwargs)
             except TypeError:
                 reply = self.ai.query(prompt)
-            reply = sanitize_ai_reply(reply)
+            reply = sanitize_ai_reply(self.ecm_bridge.filter_response(reply))
         except Exception as e:
             self.logger.error(f"AI query failed: {e}")
             return
