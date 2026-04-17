@@ -558,7 +558,7 @@ class App(tk.Tk):
 
         # OPML Tree mode widgets
         self.tree_frame = ttk.Frame(self.right_stack)
-        self.opml_tree = ttk.Treeview(self.tree_frame, show="tree")
+        self.opml_tree = ttk.Treeview(self.tree_frame, show="tree", selectmode="extended")
         tree_scroll = ttk.Scrollbar(
             self.tree_frame, orient="vertical", command=self.opml_tree.yview
         )
@@ -566,6 +566,8 @@ class App(tk.Tk):
         self.opml_tree.pack(side="left", fill="both", expand=True)
         self.opml_tree.bind("<<TreeviewSelect>>", self._on_opml_tree_selection_changed)
         self.opml_tree.bind("<ButtonRelease-1>", self._on_opml_tree_selection_changed)
+        self.opml_tree.bind("<Double-1>", lambda e: self._toggle_opml_item())
+        self.opml_tree.bind("<Return>", lambda e: self._toggle_opml_item())
         tree_scroll.pack(side="left", fill="y")
 
         # Start in text mode
@@ -673,6 +675,14 @@ class App(tk.Tk):
                 seen.add(payload)
                 payloads.append(payload)
         return "\n\n".join(payloads).strip()
+
+    def _toggle_opml_item(self):
+        sel = self.opml_tree.selection()
+        if not sel:
+            return
+        item_id = sel[0]
+        is_open = bool(self.opml_tree.item(item_id, "open"))
+        self.opml_tree.item(item_id, open=not is_open)
 
     def _on_opml_tree_selection_changed(self, event=None):
         try:
