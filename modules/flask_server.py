@@ -548,6 +548,34 @@ def _convert_payload_to_opml_api(title: str, payload: Any) -> str:
     )
 
 
+def _convert_doc_to_opml_db(source_doc_id: int) -> Dict[str, Any]:
+    with _db_connect() as conn:
+        row = _db_get_doc(conn, source_doc_id)
+        if not row:
+            raise ValueError(f"Source doc not found: {source_doc_id}")
+        source_title = _s(row["title"], "Document")
+        source_body = row["body"]
+        if source_body is None:
+            source_body = ""
+
+        opml = _convert_payload_to_opml_api(source_title, source_body)
+        new_title = f"{source_title} (OPML)"
+        cur = conn.execute(
+            "INSERT INTO documents (title, body) VALUES (?, ?)",
+            (new_title, opml),
+        )
+        conn.commit()
+        new_doc_id = int(cur.lastrowid)
+        created = _db_get_doc(conn, new_doc_id)
+
+    return {
+        "status": "ok",
+        "source_doc_id": source_doc_id,
+        "new_doc_id": new_doc_id,
+        "created_doc": dict(created) if created else None,
+    }
+
+
 # -------------------- app --------------------
 
 def create_app():
@@ -792,36 +820,71 @@ def create_app():
             source_doc_id = _coerce_int(raw_source_doc_id, "source_doc_id") if raw_source_doc_id is not None else None
             if source_doc_id is None:
                 raise ValueError("source_doc_id is required for Convert to OPML")
-
-            with _db_connect() as conn:
-                row = _db_get_doc(conn, source_doc_id)
-                if not row:
-                    raise ValueError(f"Source doc not found: {source_doc_id}")
-                source_title = _s(row["title"], "Document")
-                source_body = row["body"]
-                if source_body is None:
-                    source_body = ""
-
-                opml = _convert_payload_to_opml_api(source_title, source_body)
-                new_title = f"{source_title} (OPML)"
-                cur = conn.execute(
-                    "INSERT INTO documents (title, body) VALUES (?, ?)",
-                    (new_title, opml),
-                )
-                conn.commit()
-                new_doc_id = int(cur.lastrowid)
-                created = _db_get_doc(conn, new_doc_id)
-
-            return jsonify({
-                "status": "ok",
-                "source_doc_id": source_doc_id,
-                "new_doc_id": new_doc_id,
-                "created_doc": dict(created) if created else None,
-            })
+            return jsonify(_convert_doc_to_opml_db(source_doc_id))
         except ValueError as e:
             return jsonify({"status": "error", "error": str(e)}), 400
         except Exception as e:
             print("[flask_server] /api/convert_to_opml failed:", e, file=sys.stderr)
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/distill_to_opml", methods=["POST"])
+    def api_distill_to_opml():
+        _require_auth()
+        if not request.is_json:
+            abort(400, description="Expected application/json")
+        payload = request.get_json(silent=True) or {}
+        try:
+            raw_source_doc_id = payload.get("source_doc_id", payload.get("source_doc", payload.get("doc_id")))
+            source_doc_id = _coerce_int(raw_source_doc_id, "source_doc_id") if raw_source_doc_id is not None else None
+            source_text = payload.get("source_text")
+            source_text = _s(source_text) if source_text is not None else None
+            source_title = _s(payload.get("source_title")).strip() or None
+            selected_text = _s(payload.get("selected_text")).strip() or None
+            distilled_body = payload.get("distilled_body")
+            distilled_body = _s(distilled_body) if distilled_body is not None else None
+
+            sel_start = payload.get("sel_start")
+            sel_end = payload.get("sel_end")
+            sel_start = _coerce_int(sel_start, "sel_start") if sel_start is not None else None
+            sel_end = _coerce_int(sel_end, "sel_end") if sel_end is not None else None
+
+            source_doc_id, source_text, source_title = _resolve_distill_source(
+                source_doc_id=source_doc_id,
+                source_text=source_text,
+                source_title=source_title,
+            )
+
+            if distilled_body is not None:
+                distill_result = _distill_insert_db(
+                    source_doc_id=source_doc_id,
+                    source_text=source_text,
+                    source_title=source_title,
+                    distilled_body=distilled_body,
+                    selected_text=selected_text,
+                    sel_start=sel_start,
+                    sel_end=sel_end,
+                )
+            else:
+                distill_result = _distill_native_ai(
+                    source_doc_id=source_doc_id,
+                    source_text=source_text,
+                    source_title=source_title,
+                    selected_text=selected_text,
+                    sel_start=sel_start,
+                    sel_end=sel_end,
+                )
+
+            opml_result = _convert_doc_to_opml_db(int(distill_result["new_doc_id"]))
+            return jsonify({
+                "status": "ok",
+                "distill": distill_result,
+                "opml": opml_result,
+            })
+        except ValueError as e:
+            return jsonify({"status": "error", "error": str(e)}), 400
+        except Exception as e:
+            print("[flask_server] /api/distill_to_opml failed:", e, file=sys.stderr)
             traceback.print_exc()
             return jsonify({"status": "error", "error": str(e)}), 500
 
