@@ -558,17 +558,21 @@ class App(tk.Tk):
 
         # OPML Tree mode widgets
         self.tree_frame = ttk.Frame(self.right_stack)
-        self.opml_tree = ttk.Treeview(self.tree_frame, show="tree", selectmode="extended")
+        self.opml_tree = ttk.Treeview(
+            self.tree_frame,
+            columns=("attrs",),
+            show="tree",
+            selectmode="extended",
+        )
         tree_scroll = ttk.Scrollbar(
             self.tree_frame, orient="vertical", command=self.opml_tree.yview
         )
         self.opml_tree.configure(yscrollcommand=tree_scroll.set)
         self.opml_tree.pack(side="left", fill="both", expand=True)
-        self.opml_tree.bind("<<TreeviewSelect>>", self._on_opml_tree_selection_changed)
-        self.opml_tree.bind("<ButtonRelease-1>", self._on_opml_tree_selection_changed)
+        tree_scroll.pack(side="left", fill="y")
+        self.opml_tree.bind("<<TreeviewSelect>>", self._on_opml_selection_changed)
         self.opml_tree.bind("<Double-1>", lambda e: self._toggle_opml_item())
         self.opml_tree.bind("<Return>", lambda e: self._toggle_opml_item())
-        tree_scroll.pack(side="left", fill="y")
 
         # Start in text mode
         self._show_text_mode()
@@ -630,51 +634,9 @@ class App(tk.Tk):
         except Exception:
             self._last_selection = None
 
-    def _collect_opml_subtree_lines(self, item_id: str, depth: int = 0) -> list[str]:
-        try:
-            item = self.opml_tree.item(item_id)
-        except Exception:
-            return []
-        label = str(item.get("text", "") or "").strip()
-        line = f"{'  ' * depth}{label}" if label else ""
-        lines = [line] if line else []
-        try:
-            children = self.opml_tree.get_children(item_id)
-        except Exception:
-            children = []
-        for child_id in children:
-            lines.extend(self._collect_opml_subtree_lines(child_id, depth + 1))
-        if not lines:
-            cached = self._opml_tree_payloads.get(item_id, "").strip()
-            return [cached] if cached else []
-        return lines
-
-    def _opml_tree_text_for_item(self, item_id: str, depth: int = 0) -> str:
-        return "\n".join(self._collect_opml_subtree_lines(item_id, depth)).strip()
-
-    def _get_selected_opml_text(self) -> str:
-        if self._mode != "opml":
-            return ""
-        selected = []
-        try:
-            selected = list(self.opml_tree.selection())
-            if not selected:
-                focused = self.opml_tree.focus()
-                if focused:
-                    selected = [focused]
-        except Exception:
-            selected = []
-        if not selected:
-            selected = list(self._last_opml_selection_ids)
-
-        payloads = []
-        seen = set()
-        for item_id in selected:
-            payload = self._opml_tree_text_for_item(item_id).strip()
-            if payload and payload not in seen:
-                seen.add(payload)
-                payloads.append(payload)
-        return "\n\n".join(payloads).strip()
+    def _on_opml_selection_changed(self, event=None):
+        # Treeview maintains selection internally.
+        pass
 
     def _toggle_opml_item(self):
         sel = self.opml_tree.selection()
@@ -684,24 +646,47 @@ class App(tk.Tk):
         is_open = bool(self.opml_tree.item(item_id, "open"))
         self.opml_tree.item(item_id, open=not is_open)
 
-    def _on_opml_tree_selection_changed(self, event=None):
-        try:
-            selected = list(self.opml_tree.selection())
-            if not selected:
-                focused = self.opml_tree.focus()
-                if focused:
-                    selected = [focused]
-            if selected:
-                self._last_opml_selection_ids = list(selected)
-            self._last_opml_selection_text = self._get_selected_opml_text()
-        except Exception:
-            self._last_opml_selection_text = ""
+    def _collect_opml_subtree_lines(self, item_id: str, depth: int = 0) -> list[str]:
+        label = self.opml_tree.item(item_id, "text") or "(item)"
+        values = self.opml_tree.item(item_id, "values") or ()
+        attrs = values[0] if values else ""
+
+        if attrs:
+            line = ("  " * depth) + f"{label} [{attrs}]"
+        else:
+            line = ("  " * depth) + str(label)
+
+        lines = [line]
+        for child in self.opml_tree.get_children(item_id):
+            lines.extend(self._collect_opml_subtree_lines(child, depth + 1))
+        return lines
+
+    def _get_selected_opml_text(self) -> str:
+        if self._mode != "opml":
+            return ""
+
+        selected = self.opml_tree.selection()
+        if not selected:
+            focused = self.opml_tree.focus()
+            if focused:
+                selected = (focused,)
+        if not selected:
+            return ""
+
+        chunks = []
+        seen = set()
+
+        for item_id in selected:
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            subtree_lines = self._collect_opml_subtree_lines(item_id, depth=0)
+            chunks.append("\n".join(subtree_lines))
+
+        return "\n\n".join(chunks).strip()
 
     def _get_selected_text(self) -> str:
         if self._mode == "opml":
-            self._on_opml_tree_selection_changed()
-            if self._last_opml_selection_text:
-                return self._last_opml_selection_text.strip()
             return self._get_selected_opml_text()
         if self._mode != "text":
             return ""
@@ -1146,18 +1131,14 @@ class App(tk.Tk):
                     return elem.get(attr)  # type: ignore
             return "(item)"
 
-        def outline_payload(elem: ET.Element, depth: int = 0) -> str:
-            indent = "  " * depth
-            lines = [f"{indent}{node_label(elem)}"]
-            for child in elem.findall("outline"):
-                child_payload = outline_payload(child, depth + 1)
-                if child_payload:
-                    lines.append(child_payload)
-            return "\n".join(lines)
-
         def add_outline(e: ET.Element, parent=""):
-            this_id = self.opml_tree.insert(parent, "end", text=node_label(e))
-            self._opml_tree_payloads[this_id] = outline_payload(e)
+            attrs_text = " ".join(f'{k}="{v}"' for k, v in e.attrib.items())
+            this_id = self.opml_tree.insert(
+                parent,
+                "end",
+                text=node_label(e),
+                values=(attrs_text,),
+            )
             for child in e.findall("outline"):
                 add_outline(child, this_id)
 
