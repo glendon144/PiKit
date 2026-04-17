@@ -515,6 +515,39 @@ def _distill_native_ai(
     }
 
 
+def _convert_payload_to_opml_api(title: str, payload: Any) -> str:
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    try:
+        import importlib
+        eng = importlib.import_module("modules.aopmlengine")
+        if hasattr(eng, "convert_payload_to_opml"):
+            return eng.convert_payload_to_opml(title, payload)
+        text = payload.decode("utf-8", "replace") if isinstance(payload, (bytes, bytearray)) else str(payload or "")
+        low = text.lower()
+        if ("<html" in low or "<body" in low or "<div" in low or "<p" in low) and hasattr(eng, "build_opml_from_html"):
+            return eng.build_opml_from_html(title, text)
+        if hasattr(eng, "build_opml_from_text"):
+            return eng.build_opml_from_text(title, text)
+    except Exception:
+        pass
+
+    text = payload.decode("utf-8", "replace") if isinstance(payload, (bytes, bytearray)) else str(payload or "")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    body = "\n".join(f'    <outline text="{ln}"/>' for ln in lines) or '    <outline text="[empty]"/>'
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<opml version="2.0">\n'
+        f'  <head><title>{title}</title></head>\n'
+        '  <body>\n'
+        f'{body}\n'
+        '  </body>\n'
+        '</opml>\n'
+    )
+
+
 # -------------------- app --------------------
 
 def create_app():
@@ -745,6 +778,50 @@ def create_app():
             return jsonify({"status": "error", "error": str(e)}), 400
         except Exception as e:
             print("[flask_server] /api/distill failed:", e, file=sys.stderr)
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/convert_to_opml", methods=["POST"])
+    def api_convert_to_opml():
+        _require_auth()
+        if not request.is_json:
+            abort(400, description="Expected application/json")
+        payload = request.get_json(silent=True) or {}
+        try:
+            raw_source_doc_id = payload.get("source_doc_id", payload.get("source_doc", payload.get("doc_id")))
+            source_doc_id = _coerce_int(raw_source_doc_id, "source_doc_id") if raw_source_doc_id is not None else None
+            if source_doc_id is None:
+                raise ValueError("source_doc_id is required for Convert to OPML")
+
+            with _db_connect() as conn:
+                row = _db_get_doc(conn, source_doc_id)
+                if not row:
+                    raise ValueError(f"Source doc not found: {source_doc_id}")
+                source_title = _s(row["title"], "Document")
+                source_body = row["body"]
+                if source_body is None:
+                    source_body = ""
+
+                opml = _convert_payload_to_opml_api(source_title, source_body)
+                new_title = f"{source_title} (OPML)"
+                cur = conn.execute(
+                    "INSERT INTO documents (title, body) VALUES (?, ?)",
+                    (new_title, opml),
+                )
+                conn.commit()
+                new_doc_id = int(cur.lastrowid)
+                created = _db_get_doc(conn, new_doc_id)
+
+            return jsonify({
+                "status": "ok",
+                "source_doc_id": source_doc_id,
+                "new_doc_id": new_doc_id,
+                "created_doc": dict(created) if created else None,
+            })
+        except ValueError as e:
+            return jsonify({"status": "error", "error": str(e)}), 400
+        except Exception as e:
+            print("[flask_server] /api/convert_to_opml failed:", e, file=sys.stderr)
             traceback.print_exc()
             return jsonify({"status": "error", "error": str(e)}), 500
 
