@@ -265,6 +265,7 @@ class App(tk.Tk):
         self._current_content: str | bytes | None = None  # for Reparse Links
         self._mode: str = "text"  # 'text' or 'opml'
         self._opml_tree_payloads: dict[str, str] = {}
+        self._last_opml_selection_ids: list[str] = []
         self._last_opml_selection_text: str = ""
         self._last_pil_img: Optional[Image.Image] = None
         self._last_tk_img: Optional[ImageTk.PhotoImage] = None
@@ -627,6 +628,26 @@ class App(tk.Tk):
         except Exception:
             self._last_selection = None
 
+    def _opml_tree_text_for_item(self, item_id: str, depth: int = 0) -> str:
+        try:
+            item = self.opml_tree.item(item_id)
+        except Exception:
+            return ""
+        label = str(item.get("text", "") or "").strip()
+        lines = [f"{'  ' * depth}{label}"] if label else []
+        try:
+            children = self.opml_tree.get_children(item_id)
+        except Exception:
+            children = []
+        for child_id in children:
+            child_text = self._opml_tree_text_for_item(child_id, depth + 1)
+            if child_text:
+                lines.append(child_text)
+        if not lines:
+            cached = self._opml_tree_payloads.get(item_id, "").strip()
+            return cached
+        return "\n".join(lines)
+
     def _on_opml_tree_selection_changed(self, event=None):
         try:
             selected = list(self.opml_tree.selection())
@@ -634,10 +655,12 @@ class App(tk.Tk):
                 focused = self.opml_tree.focus()
                 if focused:
                     selected = [focused]
+            if selected:
+                self._last_opml_selection_ids = list(selected)
             payloads = []
             seen = set()
-            for item_id in selected:
-                payload = self._opml_tree_payloads.get(item_id, "").strip()
+            for item_id in (selected or self._last_opml_selection_ids):
+                payload = self._opml_tree_text_for_item(item_id).strip()
                 if payload and payload not in seen:
                     seen.add(payload)
                     payloads.append(payload)
@@ -648,7 +671,13 @@ class App(tk.Tk):
     def _get_selected_text(self) -> str:
         if self._mode == "opml":
             self._on_opml_tree_selection_changed()
-            return (self._last_opml_selection_text or "").strip()
+            if self._last_opml_selection_text:
+                return self._last_opml_selection_text.strip()
+            for item_id in self._last_opml_selection_ids:
+                payload = self._opml_tree_text_for_item(item_id).strip()
+                if payload:
+                    return payload
+            return ""
         if self._mode != "text":
             return ""
         try:
@@ -1077,6 +1106,7 @@ class App(tk.Tk):
         self._show_tree_mode()
         self.opml_tree.delete(*self.opml_tree.get_children())
         self._opml_tree_payloads = {}
+        self._last_opml_selection_ids = []
         self._last_opml_selection_text = ""
 
         body = root.find(".//body")
