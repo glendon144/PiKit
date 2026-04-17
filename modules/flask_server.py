@@ -354,6 +354,167 @@ def _ask_native_ai(
     }
 
 
+def _resolve_distill_source(
+    *,
+    source_doc_id: int | None,
+    source_text: str | None,
+    source_title: str | None,
+) -> tuple[int | None, str, str]:
+    if source_doc_id is not None:
+        with _db_connect() as conn:
+            row = _db_get_doc(conn, source_doc_id)
+            if not row:
+                raise ValueError(f"Source doc not found: {source_doc_id}")
+            resolved_title = source_title or _s(row["title"], "Untitled")
+            body = row["body"]
+            if body is None:
+                body = ""
+            if not isinstance(body, str):
+                raise TypeError("DISTILL currently only supports text source docs")
+            resolved_text = source_text if source_text is not None else body
+            return source_doc_id, resolved_text, resolved_title
+
+    if source_text is None:
+        raise ValueError("Provide source_doc_id or source_text")
+    return None, source_text, (source_title or "Untitled")
+
+
+def _distill_insert_db(
+    *,
+    source_doc_id: int | None,
+    source_text: str,
+    source_title: str,
+    distilled_body: str,
+    selected_text: str | None = None,
+    sel_start: int | None = None,
+    sel_end: int | None = None,
+) -> Dict[str, Any]:
+    with _db_connect() as conn:
+        new_title = f"Distilled Brief: {source_title}"
+        new_body = f"Distilled from: {source_title}\nPurpose: execution bridge\n\n{distilled_body}"
+        cur = conn.execute(
+            "INSERT INTO documents (title, body) VALUES (?, ?)",
+            (new_title, new_body),
+        )
+        new_doc_id = int(cur.lastrowid)
+        replacement_mode = "none"
+
+        if source_doc_id is not None:
+            source = _db_get_doc(conn, source_doc_id)
+            if source is None:
+                raise ValueError(f"Source doc not found: {source_doc_id}")
+            body = source["body"]
+            if body is None:
+                body = ""
+            if not isinstance(body, str):
+                raise TypeError("DISTILL currently only supports text source docs")
+
+            selection_label = (selected_text or "").strip()
+            anchor = selection_label or f"Distilled Brief ({new_doc_id})"
+            link_md = f"[{anchor}](doc:{new_doc_id})"
+            updated = None
+
+            if (
+                selection_label
+                and isinstance(sel_start, int)
+                and isinstance(sel_end, int)
+                and 0 <= sel_start < sel_end <= len(body)
+            ):
+                updated = body[:sel_start] + link_md + body[sel_end:]
+                replacement_mode = "offsets"
+            elif selection_label and selection_label in body:
+                updated = body.replace(selection_label, link_md, 1)
+                replacement_mode = "substring"
+            elif not selection_label:
+                suffix = "\n\n" if body and not body.endswith("\n") else "\n"
+                updated = body + suffix + link_md + "\n"
+                replacement_mode = "append"
+
+            if updated is not None and updated != body:
+                conn.execute(
+                    "UPDATE documents SET body = ? WHERE id = ?",
+                    (updated, source_doc_id),
+                )
+
+        conn.commit()
+        created = _db_get_doc(conn, new_doc_id)
+        updated_source = _db_get_doc(conn, source_doc_id) if source_doc_id is not None else None
+        return {
+            "status": "ok",
+            "engine": "agent_supplied",
+            "db_path": str(DB_PATH),
+            "source_doc_id": source_doc_id,
+            "new_doc_id": new_doc_id,
+            "replacement_mode": replacement_mode,
+            "created_doc": dict(created) if created else None,
+            "updated_source_doc": dict(updated_source) if updated_source else None,
+        }
+
+
+def _distill_native_ai(
+    *,
+    source_doc_id: int | None,
+    source_text: str,
+    source_title: str,
+    selected_text: str | None = None,
+    sel_start: int | None = None,
+    sel_end: int | None = None,
+) -> Dict[str, Any]:
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from modules.document_store import DocumentStore
+    from modules.ai_interface import AIInterface
+    from modules.command_processor import CommandProcessor
+
+    store = DocumentStore(str(DB_PATH))
+    ai = AIInterface()
+    processor = CommandProcessor(store, ai)
+
+    before_max = store.conn.execute("SELECT COALESCE(MAX(id), 0) FROM documents").fetchone()[0]
+    result: Dict[str, Any] = {"new_doc_id": None}
+
+    def _on_success(new_id):
+        try:
+            result["new_doc_id"] = int(new_id)
+        except Exception:
+            result["new_doc_id"] = new_id
+
+    def _on_link_created(_value):
+        return None
+
+    processor.distill_text(
+        source_text=source_text,
+        current_doc_id=source_doc_id,
+        on_success=_on_success,
+        on_link_created=_on_link_created,
+        source_title=source_title,
+        selected_text=selected_text,
+        sel_start=sel_start,
+        sel_end=sel_end,
+    )
+
+    after_max = store.conn.execute("SELECT COALESCE(MAX(id), 0) FROM documents").fetchone()[0]
+    new_doc_id = result.get("new_doc_id")
+    if new_doc_id is None and after_max > before_max:
+        new_doc_id = int(after_max)
+    if new_doc_id is None:
+        raise RuntimeError("PiKit native DISTILL did not create a new document. Check AI runtime/config.")
+
+    created = _db_get_doc(store.conn, int(new_doc_id))
+    updated_source = _db_get_doc(store.conn, source_doc_id) if source_doc_id is not None else None
+    return {
+        "status": "ok",
+        "engine": "pikit_native_ai",
+        "db_path": str(DB_PATH),
+        "source_doc_id": source_doc_id,
+        "new_doc_id": int(new_doc_id),
+        "created_doc": dict(created) if created else None,
+        "updated_source_doc": dict(updated_source) if updated_source else None,
+    }
+
+
 # -------------------- app --------------------
 
 def create_app():
@@ -530,6 +691,60 @@ def create_app():
             return jsonify({"status": "error", "error": str(e)}), 400
         except Exception as e:
             print("[flask_server] /api/ask failed:", e, file=sys.stderr)
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    @app.route("/api/distill", methods=["POST"])
+    def api_distill():
+        _require_auth()
+        if not request.is_json:
+            abort(400, description="Expected application/json")
+        payload = request.get_json(silent=True) or {}
+        try:
+            raw_source_doc_id = payload.get("source_doc_id", payload.get("source_doc", payload.get("doc_id")))
+            source_doc_id = _coerce_int(raw_source_doc_id, "source_doc_id") if raw_source_doc_id is not None else None
+            source_text = payload.get("source_text")
+            source_text = _s(source_text) if source_text is not None else None
+            source_title = _s(payload.get("source_title")).strip() or None
+            selected_text = _s(payload.get("selected_text")).strip() or None
+            distilled_body = payload.get("distilled_body")
+            distilled_body = _s(distilled_body) if distilled_body is not None else None
+
+            sel_start = payload.get("sel_start")
+            sel_end = payload.get("sel_end")
+            sel_start = _coerce_int(sel_start, "sel_start") if sel_start is not None else None
+            sel_end = _coerce_int(sel_end, "sel_end") if sel_end is not None else None
+
+            source_doc_id, source_text, source_title = _resolve_distill_source(
+                source_doc_id=source_doc_id,
+                source_text=source_text,
+                source_title=source_title,
+            )
+
+            if distilled_body is not None:
+                result = _distill_insert_db(
+                    source_doc_id=source_doc_id,
+                    source_text=source_text,
+                    source_title=source_title,
+                    distilled_body=distilled_body,
+                    selected_text=selected_text,
+                    sel_start=sel_start,
+                    sel_end=sel_end,
+                )
+            else:
+                result = _distill_native_ai(
+                    source_doc_id=source_doc_id,
+                    source_text=source_text,
+                    source_title=source_title,
+                    selected_text=selected_text,
+                    sel_start=sel_start,
+                    sel_end=sel_end,
+                )
+            return jsonify(result)
+        except ValueError as e:
+            return jsonify({"status": "error", "error": str(e)}), 400
+        except Exception as e:
+            print("[flask_server] /api/distill failed:", e, file=sys.stderr)
             traceback.print_exc()
             return jsonify({"status": "error", "error": str(e)}), 500
 
