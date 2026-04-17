@@ -1,0 +1,128 @@
+:root {
+  --panel: #545339;
+  --panel-dark: #3b3a28;
+  --brass: #ad8f57;
+  --crt-bg: #061a0f;
+  --trace: #7dff8c;
+  --trace-soft: rgba(125, 255, 140, 0.34);
+  --text: #e8d9b2;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Courier New", Courier, monospace;
+  background: radial-gradient(circle at 20% 15%, #40402d 0%, #1d1d15 50%, #0f100b 100%);
+  color: var(--text);
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+}
+
+.console {
+  width: min(1120px, 100%);
+  background: linear-gradient(var(--panel), var(--panel-dark));
+  border: 3px solid #2a291a;
+  border-radius: 16px;
+  padding: 1rem 1rem 1.2rem;
+  box-shadow: 0 0 0 3px #7d6f46 inset, 0 14px 30px rgba(0, 0, 0, 0.5);
+}
+
+.panel-header h1 {
+  margin: 0;
+  font-size: clamp(1.2rem, 2vw, 1.75rem);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.panel-header p {
+  margin: 0.35rem 0 1rem;
+  color: #d7c697;
+  font-size: 0.88rem;
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.8rem;
+  margin-bottom: 1rem;
+}
+
+label {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+}
+
+select,
+input[type="range"] {
+  width: 100%;
+  background: #222714;
+  color: var(--text);
+  border: 1px solid #7d6f46;
+  border-radius: 6px;
+  padding: 0.4rem;
+}
+
+.crt-shell {
+  padding: 0.8rem;
+  border: 2px solid #2d2b1d;
+  background: #272717;
+  border-radius: 18px;
+}
+
+.crt-bezel {
+  position: relative;
+  border-radius: 24px;
+  overflow: hidden;
+  border: 2px solid #1d1f12;
+  box-shadow: 0 0 0 2px #4e5235 inset;
+}
+
+canvas {
+  width: 100%;
+  height: auto;
+  display: block;
+  background: radial-gradient(circle at center, #0f2a19 0%, var(--crt-bg) 70%);
+}
+
+.scanline-overlay,
+.vignette-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.scanline-overlay {
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(5, 45, 24, 0.04) 0,
+    rgba(5, 45, 24, 0.04) 2px,
+    rgba(0, 0, 0, 0.24) 3px,
+    rgba(0, 0, 0, 0.24) 4px
+  );
+}
+
+.vignette-overlay {
+  background: radial-gradient(circle at center, transparent 45%, rgba(0, 0, 0, 0.54) 100%);
+}
+
+.status-strip {
+  margin-top: 0.85rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.status-strip span {
+  border: 1px solid #7d6f46;
+  background: #212211;
+  padding: 0.25rem 0.45rem;
+  border-radius: 4px;
+}
