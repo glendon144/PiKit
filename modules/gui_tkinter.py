@@ -56,6 +56,7 @@ hypertext_parser_mod = _try_import("modules.hypertext_parser")
 renderer_mod = _try_import("modules.renderer")
 opml_plugin = _try_import("modules.opml_extras_plugin_v3")
 logger_mod = _try_import("modules.logger")
+memory_dialog_open = _try_import("modules.memory_dialog", "open_memory_dialog")
 flask_server_path = Path("modules") / "flask_server.py"
 document_transfer_mod = _try_import("modules.document_transfer")
 dream_mod = _try_import("modules.dream")
@@ -263,6 +264,8 @@ class App(tk.Tk):
         self._last_selection: Tuple[str, str] | None = None
         self._current_content: str | bytes | None = None  # for Reparse Links
         self._mode: str = "text"  # 'text' or 'opml'
+        self._opml_tree_payloads: dict[str, str] = {}
+        self._last_opml_selection_text: str = ""
         self._last_pil_img: Optional[Image.Image] = None
         self._last_tk_img: Optional[ImageTk.PhotoImage] = None
         self._image_zoom_win: Optional[tk.Toplevel] = None
@@ -415,6 +418,15 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Dream", f"Dream pass failed: {e}")
 
+    def _open_memory_dialog(self):
+        if not callable(memory_dialog_open):
+            messagebox.showerror("Memory", "Memory dialog is unavailable.")
+            return
+        try:
+            memory_dialog_open(self)
+        except Exception as e:
+            messagebox.showerror("Memory", f"Failed to open memory dialog: {e}")
+
     # ---------- UI ----------
     def _build_ui(self):
         root = self
@@ -439,6 +451,10 @@ class App(tk.Tk):
             label="Convert Selection → OPML", command=self._convert_selection_to_opml
         )
         menubar.add_cascade(label="OPML", menu=opmlmenu)
+
+        toolsmenu = tk.Menu(menubar, tearoff=0)
+        toolsmenu.add_command(label="Memory…", command=self._open_memory_dialog)
+        menubar.add_cascade(label="Tools", menu=toolsmenu)
 
         root.config(menu=menubar)
 
@@ -547,6 +563,8 @@ class App(tk.Tk):
         )
         self.opml_tree.configure(yscrollcommand=tree_scroll.set)
         self.opml_tree.pack(side="left", fill="both", expand=True)
+        self.opml_tree.bind("<<TreeviewSelect>>", self._on_opml_tree_selection_changed)
+        self.opml_tree.bind("<ButtonRelease-1>", self._on_opml_tree_selection_changed)
         tree_scroll.pack(side="left", fill="y")
 
         # Start in text mode
@@ -565,6 +583,7 @@ class App(tk.Tk):
         self.context_menu.add_command(label="Ask", command=self._on_ask)
         self.context_menu.add_command(label="Distill", command=self._on_distill)
         self.context_menu.add_command(label="Send Current Document…", command=self._on_send_document)
+        self.context_menu.add_command(label="Memory…", command=self._open_memory_dialog)
         self.context_menu.add_command(
             label="Export Current…", command=self._export_current
         )
@@ -577,6 +596,7 @@ class App(tk.Tk):
         root.bind_all("<Control-Return>", lambda e: self._on_ask())
         root.bind_all("<Control-Shift-O>", lambda e: self._convert_selection_to_opml())
         root.bind_all("<Control-u>", lambda e: self._open_opml_from_file())
+        root.bind_all("<Control-m>", lambda e: (self._open_memory_dialog(), "break"))
 
     def _show_context_menu(self, event):
         try:
@@ -607,7 +627,28 @@ class App(tk.Tk):
         except Exception:
             self._last_selection = None
 
+    def _on_opml_tree_selection_changed(self, event=None):
+        try:
+            selected = list(self.opml_tree.selection())
+            if not selected:
+                focused = self.opml_tree.focus()
+                if focused:
+                    selected = [focused]
+            payloads = []
+            seen = set()
+            for item_id in selected:
+                payload = self._opml_tree_payloads.get(item_id, "").strip()
+                if payload and payload not in seen:
+                    seen.add(payload)
+                    payloads.append(payload)
+            self._last_opml_selection_text = "\n\n".join(payloads).strip()
+        except Exception:
+            self._last_opml_selection_text = ""
+
     def _get_selected_text(self) -> str:
+        if self._mode == "opml":
+            self._on_opml_tree_selection_changed()
+            return (self._last_opml_selection_text or "").strip()
         if self._mode != "text":
             return ""
         try:
@@ -1035,6 +1076,8 @@ class App(tk.Tk):
 
         self._show_tree_mode()
         self.opml_tree.delete(*self.opml_tree.get_children())
+        self._opml_tree_payloads = {}
+        self._last_opml_selection_text = ""
 
         body = root.find(".//body")
         outlines = body.findall("outline") if body is not None else []
@@ -1048,8 +1091,18 @@ class App(tk.Tk):
                     return elem.get(attr)  # type: ignore
             return "(item)"
 
+        def outline_payload(elem: ET.Element, depth: int = 0) -> str:
+            indent = "  " * depth
+            lines = [f"{indent}{node_label(elem)}"]
+            for child in elem.findall("outline"):
+                child_payload = outline_payload(child, depth + 1)
+                if child_payload:
+                    lines.append(child_payload)
+            return "\n".join(lines)
+
         def add_outline(e: ET.Element, parent=""):
             this_id = self.opml_tree.insert(parent, "end", text=node_label(e))
+            self._opml_tree_payloads[this_id] = outline_payload(e)
             for child in e.findall("outline"):
                 add_outline(child, this_id)
 
