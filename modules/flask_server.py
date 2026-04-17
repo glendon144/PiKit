@@ -7,6 +7,7 @@ import base64
 import mimetypes
 import traceback
 import secrets
+import sqlite3
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Union
 from urllib.parse import urlencode, quote
@@ -17,6 +18,7 @@ ASSETS_DIR = DATA_DIR / "assets"  # optional: holds *.b64 files
 TOKEN_FILE = Path(__file__).parent.parent / "storage" / "pikit_api_token.txt"
 DEFAULT_CERT = Path(__file__).parent.parent / "storage" / "pikit.crt"
 DEFAULT_KEY = Path(__file__).parent.parent / "storage" / "pikit.key"
+DB_PATH = Path(os.getenv("PIKIT_DB_PATH", str(Path(__file__).parent.parent / "storage" / "documents.db"))).expanduser().resolve()
 
 # -------------------- utils --------------------
 
@@ -185,14 +187,171 @@ def _load_api_token() -> Optional[str]:
     return None
 
 
+def _preview_text(doc: Dict[str, Any], limit: int = 200) -> str:
+    raw = doc.get("description")
+    if raw is None:
+        raw = doc.get("body", "")
+    return _s(raw).replace("\n", " ").replace("\r", " ")[:limit]
+
+
 def _doc_summary(doc: Dict[str, Any]) -> Dict[str, Any]:
-    doc_id = _s(doc.get("id"))
-    title = _s(doc.get("title", f"Document {doc_id}"))
-    raw_desc = doc.get("description")
-    if raw_desc is None:
-        raw_desc = doc.get("body", "")
-    desc = _s(raw_desc).replace("\n", " ")[:160]
-    return {"id": doc_id, "title": title, "description": desc}
+    return {
+        "id": _s(doc.get("id")),
+        "title": _s(doc.get("title")),
+        "description": _preview_text(doc),
+        "has_image": bool(_collect_images(doc)),
+    }
+
+
+def _db_connect() -> sqlite3.Connection:
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"PiKit database not found: {DB_PATH}")
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _db_get_doc(conn: sqlite3.Connection, doc_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT id, title, body, created_at FROM documents WHERE id = ?",
+        (doc_id,),
+    ).fetchone()
+
+
+def _coerce_int(value: Any, name: str) -> int:
+    try:
+        return int(value)
+    except Exception as e:
+        raise ValueError(f"Invalid {name}: {value!r}") from e
+
+
+def _ask_insert_db(
+    *,
+    source_doc_id: int,
+    selected_text: str,
+    response_body: str,
+    response_title: str = "AI Response",
+    sel_start: int | None = None,
+    sel_end: int | None = None,
+) -> Dict[str, Any]:
+    if not selected_text:
+        raise ValueError("selected_text is required")
+
+    with _db_connect() as conn:
+        source = _db_get_doc(conn, source_doc_id)
+        if not source:
+            raise ValueError(f"Source doc not found: {source_doc_id}")
+
+        source_body = source["body"]
+        if source_body is None:
+            source_body = ""
+        if not isinstance(source_body, str):
+            raise TypeError("Source document body is not plain text; ASK insertion only supports text docs")
+
+        cur = conn.execute(
+            "INSERT INTO documents (title, body) VALUES (?, ?)",
+            (response_title, response_body),
+        )
+        new_doc_id = int(cur.lastrowid)
+        link_md = f"[{selected_text}](doc:{new_doc_id})"
+
+        updated_body: str | None = None
+        replacement_mode = "none"
+        if (
+            isinstance(sel_start, int)
+            and isinstance(sel_end, int)
+            and 0 <= sel_start < sel_end <= len(source_body)
+        ):
+            updated_body = source_body[:sel_start] + link_md + source_body[sel_end:]
+            replacement_mode = "offsets"
+        elif selected_text in source_body:
+            updated_body = source_body.replace(selected_text, link_md, 1)
+            replacement_mode = "substring"
+        else:
+            updated_body = source_body
+            replacement_mode = "not_found"
+
+        if updated_body != source_body:
+            conn.execute(
+                "UPDATE documents SET body = ? WHERE id = ?",
+                (updated_body, source_doc_id),
+            )
+
+        conn.commit()
+        created = _db_get_doc(conn, new_doc_id)
+        updated_source = _db_get_doc(conn, source_doc_id)
+        return {
+            "status": "ok",
+            "engine": "agent_supplied",
+            "db_path": str(DB_PATH),
+            "source_doc_id": source_doc_id,
+            "new_doc_id": new_doc_id,
+            "replacement_mode": replacement_mode,
+            "created_doc": dict(created) if created else None,
+            "updated_source_doc": dict(updated_source) if updated_source else None,
+        }
+
+
+def _ask_native_ai(
+    *,
+    source_doc_id: int,
+    selected_text: str,
+    prefix: str | None = None,
+    sel_start: int | None = None,
+    sel_end: int | None = None,
+) -> Dict[str, Any]:
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from modules.document_store import DocumentStore
+    from modules.ai_interface import AIInterface
+    from modules.command_processor import CommandProcessor
+
+    store = DocumentStore(str(DB_PATH))
+    ai = AIInterface()
+    processor = CommandProcessor(store, ai)
+
+    before_max = store.conn.execute("SELECT COALESCE(MAX(id), 0) FROM documents").fetchone()[0]
+    result: Dict[str, Any] = {"new_doc_id": None}
+
+    def _on_success(new_id):
+        try:
+            result["new_doc_id"] = int(new_id)
+        except Exception:
+            result["new_doc_id"] = new_id
+
+    def _on_link_created(_value):
+        return None
+
+    processor.query_ai(
+        selected_text=selected_text,
+        current_doc_id=source_doc_id,
+        on_success=_on_success,
+        on_link_created=_on_link_created,
+        prefix=prefix,
+        sel_start=sel_start,
+        sel_end=sel_end,
+    )
+
+    after_max = store.conn.execute("SELECT COALESCE(MAX(id), 0) FROM documents").fetchone()[0]
+    new_doc_id = result.get("new_doc_id")
+    if new_doc_id is None and after_max > before_max:
+        new_doc_id = int(after_max)
+    if new_doc_id is None:
+        raise RuntimeError("PiKit native ASK did not create a new document. Check AI runtime/config.")
+
+    created = _db_get_doc(store.conn, int(new_doc_id))
+    updated_source = _db_get_doc(store.conn, source_doc_id)
+    return {
+        "status": "ok",
+        "engine": "pikit_native_ai",
+        "db_path": str(DB_PATH),
+        "source_doc_id": source_doc_id,
+        "new_doc_id": int(new_doc_id),
+        "created_doc": dict(created) if created else None,
+        "updated_source_doc": dict(updated_source) if updated_source else None,
+    }
 
 
 # -------------------- app --------------------
@@ -313,6 +472,66 @@ def create_app():
         if not shared:
             abort(404)
         return jsonify(shared)
+
+    @app.route("/api/stats")
+    def api_stats():
+        _require_auth()
+        docs = list(_iter_docs())
+        return jsonify({
+            "status": "ok",
+            "exported_docs_exists": DATA_DIR.exists(),
+            "doc_count": len(docs),
+            "sample": [_doc_summary(doc) for doc in docs[:10]],
+        })
+
+    @app.route("/api/ask", methods=["POST"])
+    def api_ask():
+        _require_auth()
+        if not request.is_json:
+            abort(400, description="Expected application/json")
+        payload = request.get_json(silent=True) or {}
+        try:
+            source_doc_id = _coerce_int(
+                payload.get("source_doc_id", payload.get("source_doc", payload.get("doc_id"))),
+                "source_doc_id",
+            )
+            selected_text = _s(payload.get("selected_text")).strip()
+            if not selected_text:
+                raise ValueError("selected_text is required")
+
+            response_title = _s(payload.get("response_title") or "AI Response")
+            response_body = payload.get("response_body")
+            prefix = _s(payload.get("prefix")).strip() or None
+
+            sel_start = payload.get("sel_start")
+            sel_end = payload.get("sel_end")
+            sel_start = _coerce_int(sel_start, "sel_start") if sel_start is not None else None
+            sel_end = _coerce_int(sel_end, "sel_end") if sel_end is not None else None
+
+            if response_body is not None:
+                result = _ask_insert_db(
+                    source_doc_id=source_doc_id,
+                    selected_text=selected_text,
+                    response_body=_s(response_body),
+                    response_title=response_title,
+                    sel_start=sel_start,
+                    sel_end=sel_end,
+                )
+            else:
+                result = _ask_native_ai(
+                    source_doc_id=source_doc_id,
+                    selected_text=selected_text,
+                    prefix=prefix,
+                    sel_start=sel_start,
+                    sel_end=sel_end,
+                )
+            return jsonify(result)
+        except ValueError as e:
+            return jsonify({"status": "error", "error": str(e)}), 400
+        except Exception as e:
+            print("[flask_server] /api/ask failed:", e, file=sys.stderr)
+            traceback.print_exc()
+            return jsonify({"status": "error", "error": str(e)}), 500
 
     @app.route("/")
     def index():
