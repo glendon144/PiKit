@@ -1,6 +1,8 @@
 const canvas = document.getElementById("scope");
 const ctx = canvas.getContext("2d");
 const tickerSelect = document.getElementById("tickerSelect");
+const symbolInput = document.getElementById("symbolInput");
+const addSymbolButton = document.getElementById("addSymbolButton");
 const timebaseSelect = document.getElementById("timebaseSelect");
 const timebaseKnob = document.getElementById("timebaseKnob");
 const statusTicker = document.getElementById("statusTicker");
@@ -23,16 +25,60 @@ function buildSeries() {
   const output = {};
 
   Object.entries(seeds).forEach(([symbol, base]) => {
-    let value = base;
-    output[symbol] = Array.from({ length: TOTAL_SAMPLES }, (_, index) => {
-      const wobble = Math.sin(index / 9) * 1.2 + Math.cos(index / 27) * 0.9;
-      const drift = (Math.random() - 0.48) * 3;
-      value = Math.max(30, value + wobble * 0.45 + drift);
-      return Number(value.toFixed(2));
-    });
+    output[symbol] = makeSyntheticSeries(base, symbol);
   });
 
   return output;
+}
+
+function hashSymbol(symbol) {
+  return symbol.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
+}
+
+function makeSyntheticSeries(base, symbol) {
+  const symbolHash = hashSymbol(symbol);
+  let value = base;
+
+  return Array.from({ length: TOTAL_SAMPLES }, (_, index) => {
+    const wobble = Math.sin(index / 9 + symbolHash / 30) * 1.2 + Math.cos(index / 27 + symbolHash / 40) * 0.9;
+    const drift = Math.sin(index / 5 + symbolHash / 10) * 0.85 + Math.cos(index / 13 + symbolHash / 12) * 0.55;
+    value = Math.max(18, value + wobble * 0.45 + drift);
+    return Number(value.toFixed(2));
+  });
+}
+
+function estimateSeedPrice(symbol) {
+  const symbolHash = hashSymbol(symbol);
+  return 80 + (symbolHash % 420);
+}
+
+function normalizeSymbol(raw) {
+  return raw.trim().toUpperCase().replace(/[^A-Z0-9.\-]/g, "").slice(0, 8);
+}
+
+function addSymbol(symbol) {
+  if (SERIES[symbol]) {
+    tickerSelect.value = symbol;
+    return;
+  }
+
+  SERIES[symbol] = makeSyntheticSeries(estimateSeedPrice(symbol), symbol);
+
+  const option = document.createElement("option");
+  option.value = symbol;
+  option.textContent = symbol;
+  tickerSelect.append(option);
+  tickerSelect.value = symbol;
+  traceStep = 0;
+}
+
+function handleAddSymbol() {
+  const symbol = normalizeSymbol(symbolInput.value);
+  if (!symbol) return;
+
+  addSymbol(symbol);
+  symbolInput.value = "";
+  symbolInput.focus();
 }
 
 function labelForSamples(sampleCount) {
@@ -52,7 +98,7 @@ function syncTimebase(choice) {
 function getVisibleSeries() {
   const ticker = tickerSelect.value;
   const requested = Number(timebaseKnob.value);
-  const data = SERIES[ticker];
+  const data = SERIES[ticker] || SERIES.AAPL;
   return data.slice(-requested);
 }
 
@@ -148,6 +194,18 @@ timebaseKnob.addEventListener("input", (event) => {
     Math.abs(curr - value) < Math.abs(prev - value) ? curr : prev
   );
   timebaseSelect.value = String(snap);
+});
+
+addSymbolButton.addEventListener("click", handleAddSymbol);
+symbolInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    handleAddSymbol();
+  }
+});
+
+tickerSelect.addEventListener("change", () => {
+  traceStep = 0;
 });
 
 syncTimebase(520);
