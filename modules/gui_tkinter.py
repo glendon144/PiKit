@@ -15,12 +15,20 @@
 from __future__ import annotations
 
 import base64
+import os
+import queue
+import socket
+import subprocess
+import sys
+import threading
+import time
 from io import BytesIO
 from pathlib import Path
 import sqlite3
 import tkinter as tk
 from tkinter import ttk, filedialog, simpledialog, messagebox
 from typing import Any, Tuple, Optional
+from urllib import request
 import xml.etree.ElementTree as ET
 
 # ---- Optional image support (Pillow) ----
@@ -48,7 +56,10 @@ hypertext_parser_mod = _try_import("modules.hypertext_parser")
 renderer_mod = _try_import("modules.renderer")
 opml_plugin = _try_import("modules.opml_extras_plugin_v3")
 logger_mod = _try_import("modules.logger")
+memory_dialog_open = _try_import("modules.memory_dialog", "open_memory_dialog")
 flask_server_path = Path("modules") / "flask_server.py"
+document_transfer_mod = _try_import("modules.document_transfer")
+dream_mod = _try_import("modules.dream")
 
 # ---- Legacy/alternate module names (shims) ----
 if command_processor_mod is None:
@@ -65,6 +76,14 @@ if command_processor_mod:
         getattr(command_processor_mod, "CmdProcessor", None),
     )
 
+DreamProcessorClass = None
+if dream_mod:
+    DreamProcessorClass = getattr(
+        dream_mod,
+        "DreamProcessor",
+        getattr(dream_mod, "DreamEngine", None),
+    )
+
 # Resolve link parser function(s)
 parse_links = None
 if hypertext_parser_mod:
@@ -79,6 +98,26 @@ render_binary_as_text = getattr(renderer_mod or object(), "render_binary_as_text
 
 # Logger
 Logger = getattr(logger_mod or object(), "Logger", None)
+DEFAULT_FLASK_PORT = getattr(document_transfer_mod or object(), "DEFAULT_FLASK_PORT", 5050)
+DEFAULT_TRANSFER_PORT = getattr(
+    document_transfer_mod or object(), "DEFAULT_TRANSFER_PORT", 55055
+)
+DEFAULT_TIMEOUT = getattr(document_transfer_mod or object(), "DEFAULT_TIMEOUT", 15.0)
+create_server_ssl_context = getattr(
+    document_transfer_mod or object(), "create_server_ssl_context", None
+)
+create_client_ssl_context = getattr(
+    document_transfer_mod or object(), "create_client_ssl_context", None
+)
+ensure_local_tls_material = getattr(
+    document_transfer_mod or object(), "ensure_local_tls_material", None
+)
+fetch_shared_document = getattr(document_transfer_mod or object(), "fetch_shared_document", None)
+infer_local_ip_for_peer = getattr(
+    document_transfer_mod or object(), "infer_local_ip_for_peer", None
+)
+read_json_line = getattr(document_transfer_mod or object(), "read_json_line", None)
+write_json_line = getattr(document_transfer_mod or object(), "write_json_line", None)
 
 # ---------- Helpers ----------
 
@@ -225,13 +264,23 @@ class App(tk.Tk):
         self._last_selection: Tuple[str, str] | None = None
         self._current_content: str | bytes | None = None  # for Reparse Links
         self._mode: str = "text"  # 'text' or 'opml'
+        self._opml_tree_payloads: dict[str, str] = {}
+        self._last_opml_selection_ids: list[str] = []
+        self._last_opml_selection_text: str = ""
         self._last_pil_img: Optional[Image.Image] = None
         self._last_tk_img: Optional[ImageTk.PhotoImage] = None
         self._image_zoom_win: Optional[tk.Toplevel] = None
+        self._flask_process = None
+        self._transfer_server = None
+        self._transfer_ssl_context = None
+        self._transfer_stop = threading.Event()
 
         self.doc_store = kwargs.get("doc_store") or doc_store_pos
         self.processor = kwargs.get("processor") or processor_pos
         self.logger = getattr(self.processor, "logger", Logger() if Logger else None)
+        self.dream_enabled = False
+        self.dream_processor = None
+        self.dream_db_path = Path("storage") / "dreams.db"
         # ---------------------------------------------
         # ECM (Emotional Context Module) initialization 
         # ---------------------------------------------
@@ -251,8 +300,133 @@ class App(tk.Tk):
             except Exception as e:
                 print("Warning: CommandProcessor failed to init:", e)
 
+        self._setup_dream_processor()
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._start_transfer_listener()
         self._refresh_index()
+
+    def _setup_dream_processor(self):
+        if not DreamProcessorClass:
+            return
+        try:
+            self.dream_db_path.parent.mkdir(parents=True, exist_ok=True)
+            self.dream_db_path.touch(exist_ok=True)
+
+            created = None
+            for args, kwargs in [
+                ((str(self.dream_db_path),), {"main_db_reader": self._dream_main_db_reader}),
+                ((str(self.dream_db_path),), {}),
+                ((self.doc_store,), {}),
+                ((), {}),
+            ]:
+                try:
+                    created = DreamProcessorClass(*args, **kwargs)
+                    break
+                except TypeError:
+                    continue
+
+            self.dream_processor = created
+            if self.dream_processor and hasattr(self.dream_processor, "start"):
+                self.dream_processor.start()
+            if self.dream_processor and hasattr(self.dream_processor, "authorize"):
+                self.dream_processor.authorize(False)
+            if self.processor and hasattr(self.processor, "set_dream_handler"):
+                self.processor.set_dream_handler(self._record_dream_event)
+        except Exception as e:
+            print("Warning: Dream processor failed to init:", e)
+            self.dream_processor = None
+
+    def _dream_main_db_reader(self):
+        if not self.doc_store or not hasattr(self.doc_store, "get_document_index"):
+            return ""
+        try:
+            rows = self.doc_store.get_document_index() or []
+        except Exception:
+            return ""
+        titles = []
+        for row in rows[:8]:
+            try:
+                title, _content = _extract_title_content(row)
+            except Exception:
+                title = ""
+            if title:
+                titles.append(title)
+        return "Recent documents: " + ", ".join(titles) if titles else ""
+
+    def _set_dream_button_label(self):
+        if hasattr(self, "dream_button") and self.dream_button:
+            self.dream_button.configure(text=f"Dream: {'ON' if self.dream_enabled else 'OFF'}")
+
+    def _record_dream_event(self, event_type: str, content: str, metadata: Optional[dict[str, Any]] = None):
+        if not self.dream_processor:
+            return
+        metadata = metadata or {}
+        source_doc_id = metadata.get("current_doc_id", self.current_doc_id)
+        try:
+            if hasattr(self.dream_processor, "add_event"):
+                self.dream_processor.add_event(
+                    event_type=event_type,
+                    content_snippet=str(content),
+                    source_doc_id=source_doc_id,
+                    metadata=metadata,
+                )
+            elif hasattr(self.dream_processor, "ingest_event"):
+                self.dream_processor.ingest_event(
+                    event_type=event_type,
+                    content=str(content),
+                    doc_id=source_doc_id,
+                    metadata=metadata,
+                )
+        except Exception as e:
+            print("Dream ingest error:", e)
+
+    def _toggle_dream(self):
+        if not self.dream_processor:
+            messagebox.showerror("Dream", "Dream processor is unavailable.")
+            return
+        self.dream_enabled = not self.dream_enabled
+        if hasattr(self.dream_processor, "authorize"):
+            try:
+                self.dream_processor.authorize(self.dream_enabled)
+            except Exception:
+                pass
+        self._set_dream_button_label()
+        self.status.set(
+            "Dream mode authorized for idle processing."
+            if self.dream_enabled
+            else "Dream mode disabled."
+        )
+
+    def _run_dream_now(self):
+        if not self.dream_processor:
+            messagebox.showerror("Dream", "Dream processor is unavailable.")
+            return
+        try:
+            capsule = None
+            if hasattr(self.dream_processor, "force_dream_pass"):
+                capsule = self.dream_processor.force_dream_pass()
+            elif hasattr(self.dream_processor, "process_tick"):
+                self.dream_processor.process_tick()
+                if hasattr(self.dream_processor, "get_latest_capsule"):
+                    capsule = self.dream_processor.get_latest_capsule()
+            elif hasattr(self.dream_processor, "get_latest_capsule"):
+                capsule = self.dream_processor.get_latest_capsule()
+            if not capsule:
+                capsule = "Dream pass completed."
+            messagebox.showinfo("Dream Capsule", str(capsule)[:3000])
+            self.status.set("Dream pass completed.")
+        except Exception as e:
+            messagebox.showerror("Dream", f"Dream pass failed: {e}")
+
+    def _open_memory_dialog(self):
+        if not callable(memory_dialog_open):
+            messagebox.showerror("Memory", "Memory dialog is unavailable.")
+            return
+        try:
+            memory_dialog_open(self)
+        except Exception as e:
+            messagebox.showerror("Memory", f"Failed to open memory dialog: {e}")
 
     # ---------- UI ----------
     def _build_ui(self):
@@ -263,6 +437,7 @@ class App(tk.Tk):
         filemenu = tk.Menu(menubar, tearoff=0)
         filemenu.add_command(label="Import Text…", command=self._import_text_file)
         filemenu.add_command(label="Export Current…", command=self._export_current)
+        filemenu.add_command(label="Send Current Document…", command=self._on_send_document)
         filemenu.add_separator()
         filemenu.add_command(
             label="Export to Intraweb (Flask)…", command=self._export_and_launch_flask
@@ -278,6 +453,10 @@ class App(tk.Tk):
         )
         menubar.add_cascade(label="OPML", menu=opmlmenu)
 
+        toolsmenu = tk.Menu(menubar, tearoff=0)
+        toolsmenu.add_command(label="Memory…", command=self._open_memory_dialog)
+        menubar.add_cascade(label="Tools", menu=toolsmenu)
+
         root.config(menu=menubar)
 
         # Toolbar
@@ -287,10 +466,21 @@ class App(tk.Tk):
         ttk.Button(bar, text="Ask", command=self._on_ask).pack(
             side="left", padx=4, pady=4
         )
+        ttk.Button(bar, text="Distill", command=self._on_distill).pack(
+            side="left", padx=4, pady=4
+        )
+        self.dream_button = ttk.Button(bar, text="Dream: OFF", command=self._toggle_dream)
+        self.dream_button.pack(side="left", padx=4, pady=4)
+        ttk.Button(bar, text="Dream Now", command=self._run_dream_now).pack(
+            side="left", padx=4, pady=4
+        )
         ttk.Button(bar, text="Back", command=self._go_back).pack(
             side="left", padx=4, pady=4
         )
         ttk.Button(bar, text="Open by ID", command=self._open_by_id).pack(
+            side="left", padx=4, pady=4
+        )
+        ttk.Button(bar, text="Send Doc", command=self._on_send_document).pack(
             side="left", padx=4, pady=4
         )
 
@@ -368,13 +558,21 @@ class App(tk.Tk):
 
         # OPML Tree mode widgets
         self.tree_frame = ttk.Frame(self.right_stack)
-        self.opml_tree = ttk.Treeview(self.tree_frame, show="tree")
+        self.opml_tree = ttk.Treeview(
+            self.tree_frame,
+            columns=("attrs",),
+            show="tree",
+            selectmode="extended",
+        )
         tree_scroll = ttk.Scrollbar(
             self.tree_frame, orient="vertical", command=self.opml_tree.yview
         )
         self.opml_tree.configure(yscrollcommand=tree_scroll.set)
         self.opml_tree.pack(side="left", fill="both", expand=True)
         tree_scroll.pack(side="left", fill="y")
+        self.opml_tree.bind("<<TreeviewSelect>>", self._on_opml_selection_changed)
+        self.opml_tree.bind("<Double-1>", lambda e: self._toggle_opml_item())
+        self.opml_tree.bind("<Return>", lambda e: self._toggle_opml_item())
 
         # Start in text mode
         self._show_text_mode()
@@ -390,6 +588,9 @@ class App(tk.Tk):
         # Context menu
         self.context_menu = tk.Menu(root, tearoff=0)
         self.context_menu.add_command(label="Ask", command=self._on_ask)
+        self.context_menu.add_command(label="Distill", command=self._on_distill)
+        self.context_menu.add_command(label="Send Current Document…", command=self._on_send_document)
+        self.context_menu.add_command(label="Memory…", command=self._open_memory_dialog)
         self.context_menu.add_command(
             label="Export Current…", command=self._export_current
         )
@@ -402,6 +603,7 @@ class App(tk.Tk):
         root.bind_all("<Control-Return>", lambda e: self._on_ask())
         root.bind_all("<Control-Shift-O>", lambda e: self._convert_selection_to_opml())
         root.bind_all("<Control-u>", lambda e: self._open_opml_from_file())
+        root.bind_all("<Control-m>", lambda e: (self._open_memory_dialog(), "break"))
 
     def _show_context_menu(self, event):
         try:
@@ -432,7 +634,60 @@ class App(tk.Tk):
         except Exception:
             self._last_selection = None
 
+    def _on_opml_selection_changed(self, event=None):
+        # Treeview maintains selection internally.
+        pass
+
+    def _toggle_opml_item(self):
+        sel = self.opml_tree.selection()
+        if not sel:
+            return
+        item_id = sel[0]
+        is_open = bool(self.opml_tree.item(item_id, "open"))
+        self.opml_tree.item(item_id, open=not is_open)
+
+    def _collect_opml_subtree_lines(self, item_id: str, depth: int = 0) -> list[str]:
+        label = self.opml_tree.item(item_id, "text") or "(item)"
+        values = self.opml_tree.item(item_id, "values") or ()
+        attrs = values[0] if values else ""
+
+        if attrs:
+            line = ("  " * depth) + f"{label} [{attrs}]"
+        else:
+            line = ("  " * depth) + str(label)
+
+        lines = [line]
+        for child in self.opml_tree.get_children(item_id):
+            lines.extend(self._collect_opml_subtree_lines(child, depth + 1))
+        return lines
+
+    def _get_selected_opml_text(self) -> str:
+        if self._mode != "opml":
+            return ""
+
+        selected = self.opml_tree.selection()
+        if not selected:
+            focused = self.opml_tree.focus()
+            if focused:
+                selected = (focused,)
+        if not selected:
+            return ""
+
+        chunks = []
+        seen = set()
+
+        for item_id in selected:
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            subtree_lines = self._collect_opml_subtree_lines(item_id, depth=0)
+            chunks.append("\n".join(subtree_lines))
+
+        return "\n\n".join(chunks).strip()
+
     def _get_selected_text(self) -> str:
+        if self._mode == "opml":
+            return self._get_selected_opml_text()
         if self._mode != "text":
             return ""
         try:
@@ -446,6 +701,283 @@ class App(tk.Tk):
             except Exception:
                 return ""
         return ""
+
+    # ---------- Networked document sharing ----------
+    def _on_close(self):
+        self._transfer_stop.set()
+        if self._transfer_server is not None:
+            try:
+                self._transfer_server.close()
+            except Exception:
+                pass
+            self._transfer_server = None
+        if self.dream_processor and hasattr(self.dream_processor, "stop"):
+            try:
+                self.dream_processor.stop()
+            except Exception:
+                pass
+        self.destroy()
+
+    def _start_transfer_listener(self):
+        if not callable(create_server_ssl_context):
+            if self.logger:
+                self.logger.error("Document transfer listener unavailable: TLS helpers missing.")
+            return
+        try:
+            if callable(ensure_local_tls_material):
+                ensure_local_tls_material()
+            self._transfer_ssl_context = create_server_ssl_context()
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("0.0.0.0", DEFAULT_TRANSFER_PORT))
+            listener.listen(5)
+            listener.settimeout(1.0)
+            self._transfer_server = listener
+        except Exception as e:
+            self._transfer_server = None
+            self._transfer_ssl_context = None
+            if self.logger:
+                self.logger.error(f"Failed to start transfer listener on port {DEFAULT_TRANSFER_PORT}: {e}")
+            return
+
+        thread = threading.Thread(target=self._transfer_accept_loop, daemon=True)
+        thread.start()
+
+    def _transfer_accept_loop(self):
+        listener = self._transfer_server
+        while listener and not self._transfer_stop.is_set():
+            try:
+                conn, _addr = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(
+                target=self._handle_transfer_connection,
+                args=(conn,),
+                daemon=True,
+            ).start()
+
+    def _handle_transfer_connection(self, conn):
+        response = {"status": "error", "message": "Transfer handler did not complete."}
+        try:
+            if not self._transfer_ssl_context:
+                raise RuntimeError("TLS context is unavailable.")
+            with conn:
+                with self._transfer_ssl_context.wrap_socket(conn, server_side=True) as tls_sock:
+                    if not callable(read_json_line) or not callable(write_json_line):
+                        raise RuntimeError("Transfer framing helpers are unavailable.")
+                    invite = read_json_line(tls_sock)
+                    response_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
+                    self.after(
+                        0,
+                        lambda: self._prompt_incoming_document(invite, response_queue),
+                    )
+                    response = response_queue.get()
+                    write_json_line(tls_sock, response)
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Incoming transfer failed: {e}")
+
+    def _prompt_incoming_document(self, invite: dict[str, Any], response_queue):
+        sender_name = str(invite.get("sender_name") or "PiKit user")
+        sender_host = str(invite.get("sender_host") or "unknown host")
+        title = str(invite.get("doc_title") or "Untitled document")
+        share_url = str(invite.get("share_url") or "")
+
+        if not callable(fetch_shared_document):
+            response_queue.put({"status": "error", "message": "Share download support is unavailable."})
+            return
+        if not self.processor or not hasattr(self.processor, "import_shared_document"):
+            response_queue.put({"status": "error", "message": "Document import support is unavailable."})
+            return
+
+        accepted = messagebox.askyesno(
+            "Incoming Document",
+            f"{sender_name} at {sender_host} wants to send you:\n\n{title}\n\nAccept this document?",
+        )
+        if not accepted:
+            response_queue.put(
+                {
+                    "status": "rejected",
+                    "message": "The recipient declined the document transfer.",
+                }
+            )
+            return
+
+        try:
+            shared_payload = fetch_shared_document(share_url)
+            new_id = self.processor.import_shared_document(shared_payload)
+            self._refresh_index()
+            self._open_doc_id(new_id)
+            messagebox.showinfo(
+                "Document Received",
+                f"Imported '{title}' as document {new_id}.",
+            )
+            response_queue.put(
+                {
+                    "status": "accepted",
+                    "message": "The recipient accepted the document.",
+                    "imported_doc_id": int(new_id),
+                }
+            )
+        except Exception as e:
+            messagebox.showerror("Document Receive Failed", str(e))
+            response_queue.put({"status": "error", "message": str(e)})
+
+    def _ping_flask(self, scheme: str) -> bool:
+        url = f"{scheme}://127.0.0.1:{DEFAULT_FLASK_PORT}/health"
+        try:
+            if scheme == "https" and callable(create_client_ssl_context):
+                context = create_client_ssl_context()
+                with request.urlopen(url, timeout=2.0, context=context) as resp:
+                    return 200 <= getattr(resp, "status", 200) < 400
+            with request.urlopen(url, timeout=2.0) as resp:
+                return 200 <= getattr(resp, "status", 200) < 400
+        except Exception:
+            return False
+
+    def _detect_flask_scheme(self) -> Optional[str]:
+        if self._ping_flask("https"):
+            return "https"
+        if self._ping_flask("http"):
+            return "http"
+        return None
+
+    def _wait_for_flask_ready(self, timeout: float = 8.0) -> Optional[str]:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            scheme = self._detect_flask_scheme()
+            if scheme:
+                return scheme
+            time.sleep(0.25)
+        return None
+
+    def _ensure_flask_running_for_sharing(self) -> Optional[str]:
+        scheme = self._detect_flask_scheme()
+        if scheme:
+            return scheme
+
+        accepted = messagebox.askyesno(
+            "Start Flask Server",
+            "Sending documents requires the Flask share server.\n\nStart it now?",
+        )
+        if not accepted:
+            return None
+
+        scheme = self._export_and_launch_flask(show_dialog=False, expose_network=True)
+        if not scheme:
+            messagebox.showerror(
+                "Flask",
+                "PiKit could not start the Flask share server.",
+            )
+        return scheme
+
+    def _notify_send_result(self, response: dict[str, Any], invite: dict[str, Any]):
+        status = str(response.get("status") or "error")
+        title = str(invite.get("doc_title") or "document")
+        message = str(response.get("message") or "No response message was provided.")
+
+        if status == "accepted":
+            imported_doc_id = response.get("imported_doc_id")
+            extra = (
+                f"\nImported as remote document {imported_doc_id}."
+                if imported_doc_id is not None
+                else ""
+            )
+            messagebox.showinfo("Document Sent", f"'{title}' was accepted.{extra}")
+        elif status == "rejected":
+            messagebox.showwarning("Document Rejected", message)
+        else:
+            messagebox.showerror("Document Send Failed", message)
+        self.status.set("Ready")
+
+    def _send_document_worker(self, invite: dict[str, Any]):
+        try:
+            if not callable(create_client_ssl_context):
+                raise RuntimeError("TLS client support is unavailable.")
+            if not callable(read_json_line) or not callable(write_json_line):
+                raise RuntimeError("Transfer framing helpers are unavailable.")
+
+            recipient_host = str(invite["recipient_host"])
+            recipient_port = int(invite["recipient_port"])
+            with socket.create_connection(
+                (recipient_host, recipient_port),
+                timeout=DEFAULT_TIMEOUT,
+            ) as raw_sock:
+                raw_sock.settimeout(None)
+                with create_client_ssl_context().wrap_socket(
+                    raw_sock,
+                    server_hostname=recipient_host,
+                ) as tls_sock:
+                    write_json_line(tls_sock, invite)
+                    response = read_json_line(tls_sock)
+        except Exception as e:
+            self.after(
+                0,
+                lambda: messagebox.showerror("Document Send Failed", str(e)),
+            )
+            self.after(0, lambda: self.status.set("Ready"))
+            return
+
+        self.after(0, lambda: self._notify_send_result(response, invite))
+
+    def _on_send_document(self):
+        if self.current_doc_id is None:
+            messagebox.showwarning("Send Document", "Open a document before sending it.")
+            return
+        if not self.processor or not hasattr(self.processor, "send_document"):
+            messagebox.showerror("Send Document", "CommandProcessor.send_document is unavailable.")
+            return
+
+        recipient_host = simpledialog.askstring(
+            "Send Document",
+            "Recipient host or IP address:",
+        )
+        if not recipient_host:
+            return
+
+        recipient_port = simpledialog.askinteger(
+            "Send Document",
+            "Recipient transfer port:",
+            initialvalue=DEFAULT_TRANSFER_PORT,
+            minvalue=1024,
+            maxvalue=65535,
+        )
+        if recipient_port is None:
+            return
+
+        scheme = self._ensure_flask_running_for_sharing()
+        if not scheme:
+            return
+
+        sender_host = (
+            infer_local_ip_for_peer(recipient_host)
+            if callable(infer_local_ip_for_peer)
+            else socket.gethostbyname(socket.gethostname())
+        )
+        sender_name = os.getenv("USER") or socket.gethostname() or "PiKit user"
+
+        try:
+            invite = self.processor.send_document(
+                doc_id=int(self.current_doc_id),
+                recipient_host=recipient_host.strip(),
+                recipient_port=int(recipient_port),
+                sender_host=sender_host,
+                sender_name=sender_name,
+                flask_port=DEFAULT_FLASK_PORT,
+                share_scheme=scheme,
+            )
+        except Exception as e:
+            messagebox.showerror("Send Document", str(e))
+            return
+
+        self.status.set(f"Sending document {self.current_doc_id} to {recipient_host}:{recipient_port}...")
+        threading.Thread(
+            target=self._send_document_worker,
+            args=(invite,),
+            daemon=True,
+        ).start()
 
     # ---------- Index / navigation ----------
     def _approx_payload_size(self, content: Any) -> int:
@@ -557,6 +1089,7 @@ class App(tk.Tk):
 
         self.current_doc_id = doc_id
         self._render_document(doc)
+        self._record_dream_event("document_open", f"Opened document {doc_id}", {"current_doc_id": doc_id})
 
     # ---------- Render ----------
     def _looks_like_opml(self, text: str) -> bool:
@@ -582,6 +1115,9 @@ class App(tk.Tk):
 
         self._show_tree_mode()
         self.opml_tree.delete(*self.opml_tree.get_children())
+        self._opml_tree_payloads = {}
+        self._last_opml_selection_ids = []
+        self._last_opml_selection_text = ""
 
         body = root.find(".//body")
         outlines = body.findall("outline") if body is not None else []
@@ -596,7 +1132,13 @@ class App(tk.Tk):
             return "(item)"
 
         def add_outline(e: ET.Element, parent=""):
-            this_id = self.opml_tree.insert(parent, "end", text=node_label(e))
+            attrs_text = " ".join(f'{k}="{v}"' for k, v in e.attrib.items())
+            this_id = self.opml_tree.insert(
+                parent,
+                "end",
+                text=node_label(e),
+                values=(attrs_text,),
+            )
             for child in e.findall("outline"):
                 add_outline(child, this_id)
 
@@ -733,6 +1275,12 @@ class App(tk.Tk):
                 print("parse_links failed:", e)
 
         self.status.set(f"Viewing: {title} (id={self.current_doc_id})")
+        if isinstance(display, str):
+            self._record_dream_event(
+                "document_view",
+                display[:2000],
+                {"current_doc_id": self.current_doc_id, "title": title},
+            )
 
     def _render_binary_preview(self, payload):
         if render_binary_preview:
@@ -778,6 +1326,11 @@ class App(tk.Tk):
         # ----------------------------------------------------
         def _on_success(new_id):
             try:
+                self._record_dream_event(
+                    "ask_success",
+                    sel,
+                    {"current_doc_id": current_id, "new_doc_id": new_id},
+                )
                 messagebox.showinfo("ASK", f"Created new document {new_id}")
             finally:
                 self._refresh_index()
@@ -788,6 +1341,11 @@ class App(tk.Tk):
         def _on_link_created(new_id):
             print("DEBUG: on_link_created called with new_id =", new_id)
             try:
+                self._record_dream_event(
+                    "link_created",
+                    sel,
+                    {"current_doc_id": current_id, "new_doc_id": new_id},
+                )
                 if current_id is not None and self.doc_store:
                     doc = self.doc_store.get_document(current_id)
                     if doc:
@@ -800,6 +1358,11 @@ class App(tk.Tk):
         # ----------------------------------------------------
         # Main AI call (new-style, with prefix + callbacks)
         # ----------------------------------------------------
+        self._record_dream_event(
+            "ask_selected_text",
+            sel,
+            {"current_doc_id": current_id, "prefix": prefix or ""},
+        )
         try:
             self.processor.query_ai(
                 selected_text=sel,
@@ -816,6 +1379,116 @@ class App(tk.Tk):
                 messagebox.showerror("ASK", f"query_ai failed: {e}")
         except Exception as e:
             messagebox.showerror("ASK", f"query_ai error: {e}")
+
+
+    def _on_distill(self):
+        if not self.processor or not hasattr(self.processor, "distill_text"):
+            messagebox.showerror("DISTILL", "CommandProcessor.distill_text is unavailable.")
+            return
+
+        current_id = self.current_doc_id
+        selected_text = self._get_selected_text()
+        sel_start = None
+        sel_end = None
+        source_title = "Untitled"
+        source_text = ""
+        source_doc_id = None
+
+        if selected_text.strip():
+            source_doc_id = current_id
+            source_text = selected_text
+            try:
+                start_index = self.text.index("sel.first")
+                end_index = self.text.index("sel.last")
+                sel_start = len(self.text.get("1.0", start_index))
+                sel_end = len(self.text.get("1.0", end_index))
+            except Exception:
+                sel_start = None
+                sel_end = None
+
+            try:
+                if current_id is not None and self.doc_store:
+                    doc = self.doc_store.get_document(current_id)
+                    if doc:
+                        title, _content = _extract_title_content(doc)
+                        source_title = title or "Current Document"
+            except Exception:
+                pass
+        else:
+            highlighted_id = None
+            try:
+                sel = self.sidebar.selection()
+                if sel:
+                    item = self.sidebar.item(sel[0])
+                    vals = item.get("values") or []
+                    if vals:
+                        highlighted_id = int(vals[0])
+            except Exception:
+                highlighted_id = None
+
+            chosen_id = highlighted_id if highlighted_id is not None else current_id
+            if chosen_id is not None and self.doc_store:
+                try:
+                    doc = self.doc_store.get_document(chosen_id)
+                    if doc:
+                        source_doc_id = chosen_id
+                        title, content = _extract_title_content(doc)
+                        source_title = title or f"Document {chosen_id}"
+                        source_text = content if isinstance(content, str) else str(content)
+                except Exception as e:
+                    messagebox.showerror("DISTILL", f"Could not load source document: {e}")
+                    return
+
+        if not source_text.strip():
+            messagebox.showinfo("DISTILL", "No source text available to distill.")
+            return
+
+        def _on_success(new_id):
+            try:
+                self._record_dream_event(
+                    "distill_success",
+                    source_title,
+                    {"current_doc_id": source_doc_id, "new_doc_id": new_id},
+                )
+                self._refresh_index()
+                self._open_doc_id(new_id)
+                messagebox.showinfo("DISTILL", f"Created distilled document {new_id}")
+            finally:
+                self._refresh_index()
+
+        def _on_link_created(new_id):
+            try:
+                self._record_dream_event(
+                    "distill_link_created",
+                    source_title,
+                    {"current_doc_id": source_doc_id, "new_doc_id": new_id},
+                )
+                if source_doc_id is not None and self.doc_store and source_doc_id == self.current_doc_id:
+                    doc = self.doc_store.get_document(source_doc_id)
+                    if doc:
+                        self._render_document(doc)
+            except Exception as e:
+                print("DISTILL on_link_created error:", e)
+
+        self._record_dream_event(
+            "distill_selected_text" if selected_text.strip() else "distill_document",
+            source_title,
+            {"current_doc_id": source_doc_id},
+        )
+
+        try:
+            self.processor.distill_text(
+                source_text=source_text,
+                current_doc_id=source_doc_id,
+                on_success=_on_success,
+                on_link_created=_on_link_created,
+                source_title=source_title,
+                selected_text=selected_text if selected_text.strip() else None,
+                sel_start=sel_start,
+                sel_end=sel_end,
+            )
+        except Exception as e:
+            messagebox.showerror("DISTILL", f"distill_text error: {e}")
 
     def _go_back(self):
         if not self.history:
@@ -1140,7 +1813,7 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Export", f"Failed to save: {e}")
 
-    def _export_and_launch_flask(self):
+    def _export_and_launch_flask(self, show_dialog: bool = True, expose_network: bool = True):
         export_path = Path("exported_docs")
         export_path.mkdir(exist_ok=True)
 
@@ -1177,19 +1850,43 @@ class App(tk.Tk):
         except Exception as e:
             print("Export JSON failed:", e)
 
-        # Launch Flask if present
-        try:
-            import subprocess, sys
-
-            if flask_server_path.exists():
-                subprocess.Popen([sys.executable, str(flask_server_path)])
+        scheme = self._detect_flask_scheme()
+        if scheme:
+            if show_dialog:
                 messagebox.showinfo(
-                    "Server Started", "Flask server launched at http://127.0.0.1:5050"
+                    "Server Ready",
+                    f"Flask server is already available at {scheme}://127.0.0.1:{DEFAULT_FLASK_PORT}",
                 )
-            else:
-                messagebox.showwarning("Flask", "modules/flask_server.py not found.")
+            return scheme
+
+        try:
+            if callable(ensure_local_tls_material):
+                ensure_local_tls_material()
+            if not flask_server_path.exists():
+                raise FileNotFoundError("modules/flask_server.py not found.")
+
+            env = os.environ.copy()
+            env["PORT"] = str(DEFAULT_FLASK_PORT)
+            env["PIKIT_FLASK_HOST"] = "0.0.0.0" if expose_network else "127.0.0.1"
+            self._flask_process = subprocess.Popen(
+                [sys.executable, str(flask_server_path)],
+                env=env,
+            )
+            scheme = self._wait_for_flask_ready()
+            if not scheme:
+                raise RuntimeError("Flask server did not become ready in time.")
+
+            if show_dialog:
+                host_label = "0.0.0.0" if expose_network else "127.0.0.1"
+                messagebox.showinfo(
+                    "Server Started",
+                    f"Flask server launched at {scheme}://{host_label}:{DEFAULT_FLASK_PORT}",
+                )
+            return scheme
         except Exception as e:
-            messagebox.showerror("Flask", f"Failed to launch: {e}")
+            if show_dialog:
+                messagebox.showerror("Flask", f"Failed to launch: {e}")
+            return None
 
     @staticmethod
     def _basic_text_to_opml(text: str) -> str:

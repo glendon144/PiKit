@@ -1,13 +1,17 @@
 # PiKit Command Processor (updated with memory preamble + truncation + adaptive length)
 from __future__ import annotations
 
+import base64
+import json
 import os
+import secrets
 import time
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Tuple, Callable
 
 from modules.logger import Logger
 from modules.document_store import DocumentStore
+from modules.document_transfer import DEFAULT_FLASK_PORT
 from modules.directory_import import import_text_files_from_directory
 from modules.ai_memory import get_memory, set_memory
 from modules.text_sanitizer import sanitize_ai_reply
@@ -84,6 +88,24 @@ class CommandProcessor:
         self.doc_store = store
         self.ai = ai_interface
         self.logger = logger if logger else Logger()
+        self.dream_handler: Callable[..., None] | None = None
+
+    def set_dream_handler(self, handler: Callable[..., None] | None) -> None:
+        """Register a callback for lightweight Dream-mode event logging."""
+        self.dream_handler = handler
+
+    def _emit_dream_event(self, event_type: str, content: str, **metadata) -> None:
+        if not self.dream_handler:
+            return
+        try:
+            self.dream_handler(event_type=event_type, content=content, metadata=metadata)
+        except TypeError:
+            try:
+                self.dream_handler(event_type, content, metadata)
+            except Exception as e:
+                self.logger.info(f"Dream handler failed (non-fatal): {e}")
+        except Exception as e:
+            self.logger.info(f"Dream handler failed (non-fatal): {e}")
 
     # --------------- Memory helpers ---------------
 
@@ -139,6 +161,88 @@ class CommandProcessor:
             "Export CSV": self.doc_store.export_csv,
         }
 
+    def _share_dir(self) -> Path:
+        path = Path("exported_docs") / "_shares"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _build_shared_payload(self, doc_id: int) -> dict[str, Any]:
+        row = self.doc_store.get_document(doc_id)
+        if not row:
+            raise ValueError(f"Document {doc_id} not found.")
+
+        actual_id, title, body = _normalize_row(row)
+        if actual_id is None:
+            actual_id = doc_id
+
+        payload: dict[str, Any] = {
+            "doc_id": int(actual_id),
+            "title": title or f"Document {actual_id}",
+            "shared_at": int(time.time()),
+        }
+        if isinstance(body, (bytes, bytearray)):
+            payload["body_encoding"] = "base64"
+            payload["body"] = base64.b64encode(bytes(body)).decode("ascii")
+        else:
+            payload["body_encoding"] = "text"
+            payload["body"] = "" if body is None else str(body)
+        return payload
+
+    def send_document(
+        self,
+        doc_id: int,
+        recipient_host: str,
+        recipient_port: int,
+        sender_host: str,
+        sender_name: str | None = None,
+        flask_port: int = DEFAULT_FLASK_PORT,
+        share_scheme: str = "https",
+    ) -> dict[str, Any]:
+        if not recipient_host.strip():
+            raise ValueError("Recipient host is required.")
+        if not sender_host.strip():
+            raise ValueError("Sender host is required.")
+
+        share_id = secrets.token_urlsafe(18)
+        shared_payload = self._build_shared_payload(int(doc_id))
+        shared_payload["share_id"] = share_id
+
+        share_file = self._share_dir() / f"{share_id}.json"
+        share_file.write_text(
+            json.dumps(shared_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        sender_label = sender_name or os.getenv("USER") or "PiKit user"
+        return {
+            "kind": "document_share_invite",
+            "share_id": share_id,
+            "doc_id": shared_payload["doc_id"],
+            "doc_title": shared_payload["title"],
+            "sender_name": sender_label,
+            "sender_host": sender_host,
+            "sender_flask_port": int(flask_port),
+            "share_scheme": share_scheme,
+            "recipient_host": recipient_host.strip(),
+            "recipient_port": int(recipient_port),
+            "share_url": f"{share_scheme}://{sender_host}:{int(flask_port)}/share/{share_id}",
+            "sent_at": int(time.time()),
+        }
+
+    def import_shared_document(self, shared_payload: dict[str, Any]) -> int:
+        title = str(shared_payload.get("title") or "Shared Document")
+        encoding = str(shared_payload.get("body_encoding") or "text")
+        raw_body = shared_payload.get("body")
+
+        if encoding == "base64":
+            if not isinstance(raw_body, str):
+                raise ValueError("Shared binary document payload is invalid.")
+            body = base64.b64decode(raw_body.encode("ascii"))
+        else:
+            body = "" if raw_body is None else str(raw_body)
+
+        return self.doc_store.add_document(title, body)
+
     # ----------------- Core prompting -----------------
 
     def _choose_length_policy(self, prompt_text: str) -> tuple[int, str]:
@@ -182,6 +286,11 @@ class CommandProcessor:
             response = sanitize_ai_reply(response)
             self.logger.info("AI response received successfully")
             self._update_memory_breadcrumbs(prompt)
+            self._emit_dream_event(
+                "ask_question",
+                prompt,
+                response_preview=response[:240],
+            )
             return response
         except Exception as e:
             self.logger.error(f"AI query failed: {e}")
@@ -216,6 +325,12 @@ class CommandProcessor:
         prompt = f"{prompt_core}\n\n{steer}"
 
         self.logger.info(f"Sending prompt: max_tokens={max_toks} | {prompt}")
+        self._emit_dream_event(
+            "ask_request",
+            base_prompt,
+            current_doc_id=current_doc_id,
+            prefix=prefix or "",
+        )
 
         # Call AI
         try:
@@ -234,6 +349,12 @@ class CommandProcessor:
         # Create the AI response document
         new_doc_id = self.doc_store.add_document("AI Response", reply)
         self.logger.info(f"Created new document {new_doc_id}")
+        self._emit_dream_event(
+            "ask_response",
+            reply,
+            current_doc_id=current_doc_id,
+            new_doc_id=new_doc_id,
+        )
 
         # Try to embed a green link in the original text document
         try:
@@ -277,6 +398,13 @@ class CommandProcessor:
                             self.doc_store.update_document(current_doc_id, updated)  # type: ignore
                     except Exception as e:
                         self.logger.error(f"Failed updating original doc {current_doc_id}: {e}")
+                    else:
+                        self._emit_dream_event(
+                            "link_embed",
+                            selected_text,
+                            current_doc_id=current_doc_id,
+                            new_doc_id=new_doc_id,
+                        )
             else:
                 # Skip binary or missing bodies
                 if isinstance(body, (bytes, bytearray)):
@@ -292,7 +420,7 @@ class CommandProcessor:
 
         # Fire UI callbacks
         try:
-            on_link_created(selected_text)
+            on_link_created(new_doc_id)
         except Exception as e:
             self.logger.info(f"on_link_created callback failed (non-fatal): {e}")
         try:
@@ -357,6 +485,160 @@ class CommandProcessor:
 
         # Else, return text as-is
         return str(body or "")
+
+
+    def distill_text(
+        self,
+        source_text: str,
+        current_doc_id: int | None,
+        on_success,
+        on_link_created,
+        source_title: str | None = None,
+        selected_text: str | None = None,
+        sel_start: int | None = None,
+        sel_end: int | None = None,
+    ) -> None:
+        """
+        Distill source text into a compact execution brief, create a new document,
+        and optionally embed a green link back into the source document.
+        """
+        if not source_text or not str(source_text).strip():
+            self.logger.error("distill_text called with empty source_text")
+            return
+
+        source_title = source_title or "Untitled"
+        selection_label = (selected_text or "").strip()
+
+        distill_prompt = f"""Distill this material into a clean working brief that preserves both technical meaning and creative intention.
+
+Keep:
+- the real goal
+- important decisions already made
+- essential context discovered during exploration
+- constraints and exclusions
+- style / tone preferences
+- unresolved issues that still matter
+
+Discard:
+- repetition
+- dead ends
+- exploratory chatter that no longer affects the task
+- redundant explanation
+
+Output exactly in this format:
+
+PROJECT:
+GOAL:
+ESSENTIAL CONTEXT:
+DECISIONS MADE:
+CONSTRAINTS:
+STYLE / TONE:
+OPEN ISSUES:
+FINAL EXECUTION PROMPT:
+RISKS OF MISREADING:
+
+Source title: {source_title}
+
+Source material:
+{source_text}
+"""
+
+        conn = self._get_conn()
+        mem = get_memory(conn, key="global") if conn else {}
+        preamble = self._build_memory_preamble(mem, current_doc_id=current_doc_id)
+        prompt_core = (preamble + "\n\n" + distill_prompt) if preamble else distill_prompt
+
+        max_toks, steer = self._choose_length_policy(source_text)
+        prompt = f"{prompt_core}\n\nOutput: be concise, concrete, and structured."
+
+        self.logger.info(f"Sending DISTILL prompt: max_tokens={max_toks}")
+        self._emit_dream_event(
+            "distill_request",
+            source_text[:1000],
+            current_doc_id=current_doc_id,
+            source_title=source_title,
+        )
+
+        try:
+            kwargs = self._apply_overrides(prompt, max_toks)
+            try:
+                reply = self.ai.query(prompt, **kwargs)
+            except TypeError:
+                reply = self.ai.query(prompt)
+            reply = sanitize_ai_reply(reply)
+        except Exception as e:
+            self.logger.error(f"DISTILL AI query failed: {e}")
+            return
+
+        new_title = f"Distilled Brief: {source_title}"
+        new_body = f"Distilled from: {source_title}\nPurpose: execution bridge\n\n{reply}"
+        new_doc_id = self.doc_store.add_document(new_title, new_body)
+
+        self.logger.info(f"Created DISTILL document {new_doc_id}")
+        self._emit_dream_event(
+            "distill_response",
+            reply[:1000],
+            current_doc_id=current_doc_id,
+            new_doc_id=new_doc_id,
+        )
+
+        try:
+            original = self.doc_store.get_document(current_doc_id) if current_doc_id is not None else None
+        except Exception as e:
+            original = None
+            self.logger.error(f"Failed to load original doc {current_doc_id}: {e}")
+
+        if original is not None:
+            try:
+                _, _title, body = _normalize_row(original)
+            except Exception:
+                body = ""
+
+            if isinstance(body, str):
+                anchor = selection_label or f"Distilled Brief ({new_doc_id})"
+                link_md = f"[{anchor}](doc:{new_doc_id})"
+                updated = None
+
+                if (
+                    selection_label
+                    and isinstance(sel_start, int)
+                    and isinstance(sel_end, int)
+                    and 0 <= sel_start < sel_end <= len(body)
+                ):
+                    updated = body[:sel_start] + link_md + body[sel_end:]
+                    self.logger.info(f"Embedded DISTILL link at offsets {sel_start}-{sel_end}")
+                elif selection_label and selection_label in body:
+                    updated = body.replace(selection_label, link_md, 1)
+                    self.logger.info("Embedded DISTILL link by substring replace")
+                elif not selection_label:
+                    suffix = "\n\n" if body and not body.endswith("\n") else "\n"
+                    updated = body + suffix + link_md + "\n"
+                    self.logger.info("Appended DISTILL link to end of source document")
+
+                if updated is not None:
+                    try:
+                        if hasattr(self.doc_store, "update_document_body"):
+                            self.doc_store.update_document_body(current_doc_id, updated)
+                        else:
+                            self.doc_store.update_document(current_doc_id, updated)  # type: ignore[arg-type]
+                    except Exception as e:
+                        self.logger.error(f"Failed updating original doc {current_doc_id}: {e}")
+
+        try:
+            self._update_memory_breadcrumbs(f"DISTILL: {source_title}")
+        except Exception:
+            pass
+
+        try:
+            on_link_created(new_doc_id)
+        except Exception as e:
+            self.logger.info(f"on_link_created callback failed (non-fatal): {e}")
+
+        try:
+            on_success(new_doc_id)
+        except Exception as e:
+            self.logger.info(f"on_success callback failed (non-fatal): {e}")
+
 
     # --------------- Bulk imports ---------------
 

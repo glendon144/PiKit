@@ -11,7 +11,7 @@ pyserial>=3.5
 pillow>=9.0.0
 flask>=3.1.1
 # OpenAI client library for API access
-openai>=0.28.0,<0.29
+openai>=1.0
 
 # Note: tkinter is part of the Python stdlib on Linux;
 # install via apt: sudo apt install python3-tk

@@ -59,31 +59,13 @@ label {
 }
 
 select,
-input[type="range"],
-input[type="text"],
-button {
+input[type="range"] {
   width: 100%;
   background: #222714;
   color: var(--text);
   border: 1px solid #7d6f46;
   border-radius: 6px;
   padding: 0.4rem;
-}
-
-.symbol-entry {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 0.4rem;
-}
-
-button {
-  cursor: pointer;
-  font-weight: bold;
-  min-width: 70px;
-}
-
-button:hover {
-  filter: brightness(1.12);
 }
 
 .crt-shell {
