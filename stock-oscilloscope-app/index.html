@@ -10,7 +10,7 @@
     <main class="console">
       <header class="panel-header">
         <h1>Signal Corps Market Scope</h1>
-        <p>WWII-style stock ticker visualization terminal</p>
+        <p>WWII-style stock ticker with a 30-second live quote feed</p>
       </header>
 
       <section class="controls" aria-label="Chart controls">
@@ -58,10 +58,11 @@
         </div>
       </section>
 
-      <footer class="status-strip">
+      <footer class="status-strip" aria-live="polite">
         <span id="statusTicker">Ticker: AAPL</span>
         <span id="statusTimebase">Timebase: 1 Year</span>
-        <span id="statusPrice">Signal: --</span>
+        <span id="statusPrice">Signal: awaiting quote</span>
+        <span id="statusSource">Source: tuning…</span>
       </footer>
     </main>
 
