@@ -8,10 +8,14 @@ const timebaseKnob = document.getElementById("timebaseKnob");
 const statusTicker = document.getElementById("statusTicker");
 const statusTimebase = document.getElementById("statusTimebase");
 const statusPrice = document.getElementById("statusPrice");
+const statusSource = document.getElementById("statusSource");
 
 const TOTAL_SAMPLES = 520;
+const POLL_INTERVAL_MS = 30_000;
 const SERIES = buildSeries();
+const QUOTES = {};
 let traceStep = 0;
+let pollTimer = null;
 
 function buildSeries() {
   const seeds = {
@@ -57,19 +61,18 @@ function normalizeSymbol(raw) {
 }
 
 function addSymbol(symbol) {
-  if (SERIES[symbol]) {
-    tickerSelect.value = symbol;
-    return;
+  if (!SERIES[symbol]) {
+    SERIES[symbol] = makeSyntheticSeries(estimateSeedPrice(symbol), symbol);
+
+    const option = document.createElement("option");
+    option.value = symbol;
+    option.textContent = symbol;
+    tickerSelect.append(option);
   }
 
-  SERIES[symbol] = makeSyntheticSeries(estimateSeedPrice(symbol), symbol);
-
-  const option = document.createElement("option");
-  option.value = symbol;
-  option.textContent = symbol;
-  tickerSelect.append(option);
   tickerSelect.value = symbol;
   traceStep = 0;
+  startPolling();
 }
 
 function handleAddSymbol() {
@@ -102,6 +105,61 @@ function getVisibleSeries() {
   return data.slice(-requested);
 }
 
+function appendLivePrice(symbol, price) {
+  const data = SERIES[symbol] || [];
+  data.push(price);
+  SERIES[symbol] = data.slice(-TOTAL_SAMPLES);
+}
+
+function formatQuoteStatus(symbol) {
+  const quote = QUOTES[symbol];
+
+  if (!quote) {
+    statusPrice.textContent = "Signal: awaiting quote";
+    statusSource.textContent = "Source: demo history";
+    return;
+  }
+
+  const sign = quote.change > 0 ? "+" : "";
+  statusPrice.textContent = `Signal: $${quote.price.toFixed(2)} (${sign}${quote.percentChange.toFixed(2)}%)`;
+  statusSource.textContent = quote.stale ? "Source: cached quote" : "Source: live quote";
+}
+
+async function refreshQuote() {
+  const symbol = tickerSelect.value;
+  statusSource.textContent = "Source: tuning…";
+
+  try {
+    const response = await fetch(`/api/quote/${encodeURIComponent(symbol)}`, {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    const payload = await response.json();
+
+    if (!response.ok) {
+      throw new Error(payload.error || `Quote request failed (${response.status})`);
+    }
+
+    if (tickerSelect.value !== symbol) return;
+
+    QUOTES[symbol] = payload;
+    appendLivePrice(symbol, payload.price);
+    formatQuoteStatus(symbol);
+  } catch (error) {
+    if (tickerSelect.value !== symbol) return;
+    statusSource.textContent = "Source: demo history";
+    statusPrice.textContent = "Signal: live feed unavailable";
+    console.warn("Unable to refresh market quote:", error);
+  }
+}
+
+function startPolling() {
+  if (pollTimer) window.clearInterval(pollTimer);
+  formatQuoteStatus(tickerSelect.value);
+  refreshQuote();
+  pollTimer = window.setInterval(refreshQuote, POLL_INTERVAL_MS);
+}
+
 function drawGrid() {
   const { width, height } = canvas;
   ctx.strokeStyle = "rgba(80, 180, 110, 0.14)";
@@ -130,7 +188,7 @@ function drawWave(points, max, min) {
   const coords = points.map((price, index) => {
     const x = index * xStep;
     const y = height - ((price - min) / range) * (height * 0.8) - height * 0.1;
-    return { x, y, price };
+    return { x, y };
   });
 
   ctx.save();
@@ -140,9 +198,9 @@ function drawWave(points, max, min) {
   ctx.shadowColor = "rgba(125, 255, 140, 0.45)";
 
   ctx.beginPath();
-  coords.forEach((p, i) => {
-    if (i === 0) ctx.moveTo(p.x, p.y);
-    else ctx.lineTo(p.x, p.y);
+  coords.forEach((point, index) => {
+    if (index === 0) ctx.moveTo(point.x, point.y);
+    else ctx.lineTo(point.x, point.y);
   });
   ctx.stroke();
 
@@ -153,8 +211,7 @@ function drawWave(points, max, min) {
   ctx.stroke();
   ctx.restore();
 
-  const idx = traceStep % coords.length;
-  const trace = coords[idx];
+  const trace = coords[traceStep % coords.length];
 
   ctx.save();
   ctx.beginPath();
@@ -164,8 +221,6 @@ function drawWave(points, max, min) {
   ctx.shadowColor = "#b5ffbc";
   ctx.fill();
   ctx.restore();
-
-  statusPrice.textContent = `Signal: ${trace.price.toFixed(2)} USD`;
 }
 
 function render() {
@@ -206,7 +261,18 @@ symbolInput.addEventListener("keydown", (event) => {
 
 tickerSelect.addEventListener("change", () => {
   traceStep = 0;
+  startPolling();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    if (pollTimer) window.clearInterval(pollTimer);
+    pollTimer = null;
+  } else {
+    startPolling();
+  }
 });
 
 syncTimebase(520);
+startPolling();
 render();
