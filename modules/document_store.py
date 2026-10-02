@@ -63,7 +63,7 @@ class DocumentStore:
 
     def get_document_index(self):
         """
-        Return[{'id': .., 'title': .., 'description': ..}, ...] -
+        Return[{'id': .., 'title': .., 'description': .., 'size': ..}, ...] -
         'description' is a 60-char preview for text docs,
         or "[12345 bytes]" for binary (images, PDFs, ...).
         """
@@ -78,10 +78,12 @@ class DocumentStore:
             if isinstance(body, bytes):
                 # binary file - show size placeholder
                 desc = f"[{len(body)} bytes]"
+                size = len(body)
             else:
                 # text - first 60 chars, single-line
                 desc = body[:60].replace("\n", " ").replace("\r", " ")
-            result.append({"id": row["id"], "title": row["title"], "description": desc})
+                size = len(body.encode("utf-8", errors="ignore"))
+            result.append({"id": row["id"], "title": row["title"], "description": desc, "size": size})
         return result
 
     def get_document(self, doc_id):

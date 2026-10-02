@@ -1009,10 +1009,12 @@ class App(tk.Tk):
 
         for row in rows:
             # Support dict/Row/tuple
+            indexed_size = None
             if isinstance(row, sqlite3.Row):
                 m = dict(row)
                 doc_id = m.get("id", m.get("doc_id", m.get("pk", None)))
                 title = str(m.get("title", m.get("name", "")) or "")
+                indexed_size = m.get("size")
                 content = (
                     m.get("content")
                     or m.get("body")
@@ -1026,6 +1028,7 @@ class App(tk.Tk):
             elif isinstance(row, dict):
                 doc_id = row.get("id") or row.get("doc_id") or row.get("pk")
                 title = str(row.get("title", row.get("name", "")) or "")
+                indexed_size = row.get("size")
                 content = (
                     row.get("content")
                     or row.get("body")
@@ -1053,7 +1056,7 @@ class App(tk.Tk):
                 )
 
             preview = _make_preview(title, content)
-            size = self._approx_payload_size(content)
+            size = indexed_size if indexed_size is not None else self._approx_payload_size(content)
             self.sidebar.insert("", "end", values=(doc_id, preview, _human_size(size)))
 
     def _on_sidebar_select(self, event=None):
@@ -1682,10 +1685,12 @@ class App(tk.Tk):
             pass
 
         for row in rows:
+            indexed_size = None
             if isinstance(row, sqlite3.Row):
                 m = dict(row)
                 doc_id = m.get("id", m.get("doc_id", m.get("pk", None)))
                 title = str(m.get("title", m.get("name", "")) or "")
+                indexed_size = m.get("size")
                 content = (
                     m.get("content")
                     or m.get("body")
@@ -1699,6 +1704,7 @@ class App(tk.Tk):
             elif isinstance(row, dict):
                 doc_id = row.get("id") or row.get("doc_id") or row.get("pk")
                 title = str(row.get("title", row.get("name", "")) or "")
+                indexed_size = row.get("size")
                 content = (
                     row.get("content")
                     or row.get("body")
@@ -1726,7 +1732,7 @@ class App(tk.Tk):
 
             hay = (_make_preview(title, content) + "\n" + str(content)).lower()
             if ql in hay:
-                size = self._approx_payload_size(content)
+                size = indexed_size if indexed_size is not None else self._approx_payload_size(content)
                 self.sidebar.insert(
                     "",
                     "end",
