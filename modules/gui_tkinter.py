@@ -428,6 +428,10 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Memory", f"Failed to open memory dialog: {e}")
 
+    def _open_provider_dialog(self):
+        from modules.provider_dropdown import ProviderDropdown
+        ProviderDropdown(self, self.processor)
+
     # ---------- UI ----------
     def _build_ui(self):
         root = self
@@ -455,6 +459,7 @@ class App(tk.Tk):
 
         toolsmenu = tk.Menu(menubar, tearoff=0)
         toolsmenu.add_command(label="Memory…", command=self._open_memory_dialog)
+        toolsmenu.add_command(label="Inference Provider…", command=self._open_provider_dialog)
         menubar.add_cascade(label="Tools", menu=toolsmenu)
 
         root.config(menu=menubar)

@@ -1,5 +1,5 @@
 """
-ai_interface.py — Baseten (OpenAI-compatible) client shim
+ai_interface.py — selectable OpenAI-compatible client shim
 Release: v1.31.3 (fix: .query supports positional args)
 Requires: openai>=1.0.0
 """
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import time
+from modules.provider_registry import ProviderRegistry, validate
 from typing import Generator, Iterable, List, Optional
 
 from openai import OpenAI
@@ -22,14 +23,19 @@ DEFAULT_TIMEOUT  = float(os.getenv("OPENAI_API_TIMEOUT", "60"))
 def _mk_client(api_key: Optional[str] = None,
                base_url: Optional[str] = None,
                timeout: Optional[float] = None) -> OpenAI:
-    key = api_key or os.getenv("BASETEN_API_KEY")
-    if not key:
-        raise RuntimeError("BASETEN_API_KEY is not set")
-    return OpenAI(
-        api_key=key,
-        base_url=base_url or DEFAULT_BASE_URL,
-        timeout=timeout or DEFAULT_TIMEOUT,
-    )
+    return OpenAI(api_key=api_key or "local-no-key", base_url=base_url,
+                  timeout=timeout or DEFAULT_TIMEOUT, max_retries=0)
+
+
+def _safe_error(error):
+    status = getattr(error, "status_code", None)
+    if status in (401, 403):
+        return "Authentication failed. Check the selected provider's API key and access permissions."
+    if isinstance(error, APITimeoutError):
+        return "Inference timed out. Check the selected endpoint and model server."
+    if isinstance(error, APIConnectionError):
+        return "Cannot connect to the selected inference endpoint. Check its base URL and server availability."
+    return f"Inference request failed (HTTP {status or 'unknown'}). Check the selected model, endpoint, and provider limits."
 
 
 def _retryable(func, /, *, retries: int = 2, backoff: float = 0.8):
@@ -41,11 +47,11 @@ def _retryable(func, /, *, retries: int = 2, backoff: float = 0.8):
                 return func(*args, **kwargs)
             except (RateLimitError, APITimeoutError, APIConnectionError, APIError) as e:
                 last_err = e
-                if attempt >= retries:
+                if getattr(e, "status_code", None) in (400, 401, 403, 404) or attempt >= retries:
                     break
                 time.sleep(delay)
                 delay *= 2
-        raise last_err
+        raise RuntimeError(_safe_error(last_err)) from None
     return _wrapped
 
 
@@ -56,17 +62,36 @@ class AIInterface:
                  api_key: Optional[str] = None,
                  base_url: Optional[str] = None,
                  model: Optional[str] = None,
-                 timeout: Optional[float] = None):
-        resolved_api_key = api_key or os.getenv("BASETEN_API_KEY")
-        self.base_url = base_url or DEFAULT_BASE_URL
-        self.model = model or DEFAULT_MODEL
+                 timeout: Optional[float] = None,
+                 provider: Optional[str] = None,
+                 registry=None):
+        self.registry = registry or ProviderRegistry()
+        self.provider = provider or self.registry.read_selected()
         self.timeout = timeout or DEFAULT_TIMEOUT
-        self._has_api_key = bool(resolved_api_key)
-        self.client = _mk_client(
-            api_key=resolved_api_key,
-            base_url=self.base_url,
-            timeout=self.timeout,
-        )
+        self.client = None
+        self._configuration_error = self.registry.error
+        if self.provider is None:
+            self.base_url = self.model = ""
+            self._has_api_key = False
+            return
+        config = self.registry.get(self.provider)
+        for key, value in (("api_key", api_key), ("base_url", base_url), ("model", model)):
+            if value is not None:
+                config[key] = value
+        self.base_url, self.model = config["base_url"], config["model"]
+        self._has_api_key = bool(config["api_key"])
+        try:
+            validate(config)
+            if self.provider != "local" and not self._has_api_key:
+                raise ValueError("API key missing for the selected provider. Configure it in Tools → Inference Provider.")
+            self.client = _mk_client(config["api_key"], self.base_url, self.timeout)
+        except ValueError as error:
+            self._configuration_error = str(error)
+
+    def _require_client(self):
+        if self.client is None:
+            raise RuntimeError(self._configuration_error or "Configure an inference provider first.")
+        return self.client
 
     def get_config(self) -> dict:
         """Return a small runtime snapshot for launcher/debug scripts."""
@@ -74,7 +99,7 @@ class AIInterface:
             "base_url": self.base_url,
             "model": self.model,
             "timeout": self.timeout,
-            "provider": "baseten-openai-compatible",
+            "provider": self.provider,
             "has_api_key": self._has_api_key,
         }
 
@@ -105,7 +130,7 @@ class AIInterface:
             kwargs["stop"] = list(stop)
         if extra:
             kwargs.update(extra)
-        resp = self.client.chat.completions.create(**kwargs)
+        resp = self._require_client().chat.completions.create(**kwargs)
         if not resp.choices:
             return ""
         return resp.choices[0].message.content or ""
@@ -142,14 +167,16 @@ class AIInterface:
         if extra:
             kwargs.update(extra)
 
-        opener = _retryable(self.client.chat.completions.create)
+        if self.provider != "baseten":
+            kwargs.pop("stream_options", None)
+        opener = _retryable(self._require_client().chat.completions.create)
         response = opener(**kwargs)
-        for chunk in response:
-            try:
+        try:
+            for chunk in response:
                 if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                     yield chunk.choices[0].delta.content
-            except Exception:
-                continue
+        except APIError as error:
+            raise RuntimeError(_safe_error(error)) from None
 
     # ---------- Convenience ----------
 
